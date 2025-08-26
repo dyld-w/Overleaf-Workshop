@@ -5,6 +5,7 @@ import * as path from 'path';
 import * as fs from 'node:fs/promises';
 import * as crypto from 'node:crypto';
 import { execFile } from 'child_process';
+import * as merge from '../merge';
 import * as DiffMatchPatch from 'diff-match-patch';
 import { BaseAPI, MemberEntity, ProjectSettingsSchema } from '../api/base';
 import { SocketIOAPI, UpdateSchema } from '../api/socketio';
@@ -107,173 +108,6 @@ export function parseUri(uri: vscode.Uri) {
     return { userId, projectId, serverName, projectName, identifier, pathParts };
 }
 
-// ======================================================
-// Shared temp utils + merge write bypass (re-entrancy guard)
-// ======================================================
-
-/** Single temp directory for all merge-related files. */
-const TEMP_DIR_NAME = 'overleaf-merge';
-
-/** Bypass set so the FS provider ignores the write we do after RESULT save. */
-const MERGE_WRITE_BYPASS = new Set<string>();
-
-/** Encode a string to UTF-8 bytes. */
-function encodeText(text: string): Uint8Array {
-    return new TextEncoder().encode(text);
-}
-
-/** Generate a short unique id for temp file names. */
-function uniqueId(): string {
-    return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-/** Return the VS Code URI for the single temp directory, creating it if needed. */
-async function getTempDirUri(): Promise<vscode.Uri> {
-    const tmpRootPath = path.join(os.tmpdir(), TEMP_DIR_NAME);
-    const tmpRootUri = vscode.Uri.file(tmpRootPath);
-    await vscode.workspace.fs.createDirectory(tmpRootUri);
-    return tmpRootUri;
-}
-
-/** Write a string to a temp file under the single temp directory. */
-async function writeTempFile(filename: string, contents: string): Promise<vscode.Uri> {
-    const tmpRootUri = await getTempDirUri();
-    const fileUri = vscode.Uri.file(path.join(tmpRootUri.fsPath, filename));
-    await vscode.workspace.fs.writeFile(fileUri, encodeText(contents));
-    return fileUri;
-}
-
-/** Delete a list of temp files, ignoring errors. */
-async function deleteTempFiles(uris: vscode.Uri[]): Promise<void> {
-    await Promise.all(uris.map(u => Promise.resolve(vscode.workspace.fs.delete(u)).catch(() => { })));
-}
-
-// =====================
-// Process helpers
-// =====================
-
-/** Exec wrapper that treats `git merge-file` exit code 1 (conflicts) as non-fatal. */
-function execFileP(cmd: string, args: string[], opts: any = {}): Promise<{ stdout: string; code: number }> {
-    return new Promise((resolve, reject) => {
-        execFile(cmd, args, { maxBuffer: 10 * 1024 * 1024, ...opts }, (err, stdout) => {
-            const code = (err as any)?.code ?? 0;
-            if (err && code !== 1) return reject(err); // real error
-            resolve({ stdout: String(stdout), code }); // code === 1 => conflicts
-        });
-    });
-}
-
-/** Normalize like Git (LF endings + NFC) to reduce bogus diffs. */
-function normalizeForMerge(s: string): string {
-    return s.replace(/\r\n/g, '\n').normalize('NFC');
-}
-
-// =====================================
-// True 3-way merge via `git merge-file`
-// =====================================
-
-/** Git-style 3-way merge (BASE/LOCAL/REMOTE) using `git merge-file`. */
-async function gitMergeFile(base: string, local: string, remote: string): Promise<{ merged: string; conflicts: boolean }> {
-    const id = uniqueId();
-    const baseUri = await writeTempFile(`BASE-${id}`, normalizeForMerge(base));
-    const localUri = await writeTempFile(`LOCAL-${id}`, normalizeForMerge(local));
-    const remoteUri = await writeTempFile(`REMOTE-${id}`, normalizeForMerge(remote));
-
-    try {
-        const { stdout, code } = await execFileP('git', [
-            'merge-file', '-p',
-            '-L', 'LOCAL', '-L', 'BASE', '-L', 'REMOTE',
-            localUri.fsPath, baseUri.fsPath, remoteUri.fsPath
-        ]);
-        return { merged: String(stdout), conflicts: code === 1 };
-    } finally {
-        await deleteTempFiles([baseUri, localUri, remoteUri]);
-    }
-}
-
-// =====================================
-// VS Code CLI Merge Editor integration
-// =====================================
-
-/** Try common VS Code CLI names; allow override via a setting. */
-async function resolveCodeCli(): Promise<string> {
-    const cfg = vscode.workspace.getConfiguration('overleafWorkshop');
-    const configured = cfg.get<string>('codeCliPath');
-    if (configured) return configured;
-
-    const candidates = process.platform === 'win32'
-        ? ['code.cmd', 'code-insiders.cmd', 'C:\\Program Files\\Microsoft VS Code\\bin\\code.cmd']
-        : ['code', 'code-insiders'];
-
-    for (const c of candidates) {
-        try { await execFileP(c, ['-v']); return c; } catch { }
-    }
-    throw new Error('VS Code CLI not found. Set overleafWorkshop.codeCliPath');
-}
-
-/** Light temp writer (Node fs) for CLI case. */
-async function writeTmp(name: string, text: string) {
-    const dir = path.join(os.tmpdir(), TEMP_DIR_NAME);
-    await fs.mkdir(dir, { recursive: true });
-    const p = path.join(dir, name);
-    await fs.writeFile(p, text);
-    return p;
-}
-
-/**
- * Launch VS Code 3-way merge via CLI and wire RESULT -> destUri.
- * Calls `onResolved(mergedText)` after RESULT save.
- * Throws FileSystemError to cancel the original save.
- */
-export async function openMergeViaCli(
-    destUri: vscode.Uri,
-    relLabel: string,
-    base: string,
-    local: string,
-    remote: string,
-    onResolved: (mergedText: string) => Promise<void>,
-) {
-    const stem = relLabel.replace(/^\/+/, '').replace(/\//g, '__');
-    const baseP = await writeTmp(`${stem}.BASE.txt`, base);
-    const localP = await writeTmp(`${stem}.LOCAL.txt`, local);
-    const remoteP = await writeTmp(`${stem}.REMOTE.txt`, remote);
-    const resultP = await writeTmp(`${stem}.RESULT.txt`, local); // seed with local
-
-    console.log('[merge] os.tmpdir() =', os.tmpdir());
-    console.log('[merge] baseP:', baseP);
-    console.log('[merge] localP:', localP);
-    console.log('[merge] remoteP:', remoteP);
-    console.log('[merge] resultP:', resultP);
-
-    // Launch merge editor
-    const codeBin = await resolveCodeCli();
-    execFile(codeBin, ['--merge', localP, remoteP, baseP, resultP, '--reuse-window']);
-
-    // resultP as Uri
-    const resultUri = vscode.Uri.file(resultP);
-
-    // When RESULT is saved…
-    const sub = vscode.workspace.onDidSaveTextDocument(async (doc) => {
-        if (doc.uri.fsPath !== resultP) return;
-        try {
-            const bytes = await vscode.workspace.fs.readFile(resultUri);
-
-            // Tell the FS provider to accept the next write silently (no conflict checks)
-            const key = destUri.toString();
-            MERGE_WRITE_BYPASS.add(key);
-            await vscode.workspace.fs.writeFile(destUri, bytes);
-            MERGE_WRITE_BYPASS.delete(key);
-
-            const mergedText = new TextDecoder().decode(bytes);
-            await onResolved(mergedText);        // push to Overleaf + advance BASE
-        } finally {
-            sub.dispose();
-            for (const p of [baseP, localP, remoteP, resultP]) { fs.rm(p).catch(() => { }); }
-        }
-    });
-
-    vscode.window.showInformationMessage('Conflicts detected — opening Merge Editor…');
-}
 
 // ======================================================
 // Virtual FS
@@ -816,11 +650,7 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     async writeFile(uri: vscode.Uri, content: Uint8Array, create: boolean, overwrite: boolean) {
         // Merge write bypass: if this write was triggered by our RESULT copy, skip processing.
-        const key = uri.toString();
-        if (MERGE_WRITE_BYPASS.has(key)) {
-            MERGE_WRITE_BYPASS.delete(key);
-            return;
-        }
+        if (merge.isBypassed(uri)) return;
 
         const { fileType, fileEntity } = await this._resolveUri(uri);
 
@@ -835,73 +665,22 @@ export class VirtualFileSystem extends vscode.Disposable {
             const doc = fileEntity as DocumentEntity;
             if (doc.version === undefined || doc.localCache === undefined || doc.remoteCache === undefined) return;
 
-            const baseStr = normalizeForMerge(doc.localCache);                 // BASE (what we last had)
-            const localStr = normalizeForMerge(new TextDecoder().decode(content)); // LOCAL (what user saved)
-            const remoteStr = normalizeForMerge(doc.remoteCache);              // REMOTE (server now)
+            const base = doc.localCache;                      // BASE
+            const local = new TextDecoder().decode(content);   // LOCAL
+            const remote = doc.remoteCache;                     // REMOTE
+            const relPath = (await this._resolveUri(uri)).fileEntity?.name ?? uri.path;
 
-            // True 3-way merge
-            const { merged: mergedText, conflicts } = await gitMergeFile(baseStr, localStr, remoteStr);
-            
-            if (conflicts) {
-                const destUri = uri;
-                const relPath = (await this._resolveUri(uri)).fileEntity?.name ?? uri.path;
+            // One-liner: handles clean merge or launches editor + writes back to VFS
+            const mergedText = await merge.resolveAndWriteForVfs({
+                title: `Merging ${relPath}`,
+                base: base, local: local, remote: remote,
+                destUri: uri,
+            });
 
-                await openMergeViaCli(
-                    destUri,
-                    relPath,
-                    baseStr,
-                    localStr,
-                    remoteStr,
-                    async (mergedText) => {
-                        await this.applyResolvedMerge(doc, destUri, mergedText);
-                    }
-                );
-                return; // not reached (save is canceled inside openMergeViaCli)
-            }
+            // Push upstream + advance caches/base
+            await this.applyResolvedMerge(doc, uri, mergedText);
 
-            // No conflicts → compute OT ops from REMOTE → MERGED
-            const mergeRes = mergedText;
-            const dmp = new DiffMatchPatch();
-            const remoteCacheAscii = Buffer.from(doc.remoteCache, 'utf-8').toString('utf-8');
-            const mergeResAscii = Buffer.from(mergeRes, 'utf-8').toString('utf-8');
-            let currentPos = 0;
-
-            const op = dmp.diff_main(remoteCacheAscii, mergeResAscii)
-                .map((part) => {
-                    const inc = part[0] === -1 ? 0 : part[1].length;
-                    const p = currentPos;
-                    currentPos += inc;
-                    if (part[0] !== 0) {
-                        return {
-                            p,
-                            i: part[0] === 1 ? part[1] : undefined,
-                            d: part[0] === -1 ? part[1] : undefined
-                        };
-                    }
-                })
-                .filter(Boolean) as any;
-
-            const update = {
-                doc: doc._id,
-                lastV: doc.lastVersion,
-                v: doc.version,
-                hash: (() => {
-                    if (!doc.mtime || Date.now() - doc.mtime > 5000) {
-                        doc.mtime = Date.now();
-                        return crypto.createHash('sha1')
-                            .update('blob ' + mergeRes.length + '\x00' + mergeRes)
-                            .digest('hex');
-                    }
-                })() as string,
-                op,
-            };
-
-            this.isDirty = op && op.length ? true : false;
-            await this.socket.applyOtUpdate(doc._id, update);
-            doc.localCache = mergeRes;
-            doc.remoteCache = mergeRes;
-            setTimeout(() => { this.notify([{ type: vscode.FileChangeType.Changed, uri }]); }, 10);
-            doc.lastVersion = doc.version;
+            return;
         }
     }
 
