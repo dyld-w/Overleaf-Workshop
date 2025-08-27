@@ -1,10 +1,5 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import * as vscode from 'vscode';
-import * as os from 'os';
-import * as path from 'path';
-import * as fs from 'node:fs/promises';
-import * as crypto from 'node:crypto';
-import { execFile } from 'child_process';
 import * as merge from '../merge';
 import * as DiffMatchPatch from 'diff-match-patch';
 import { BaseAPI, MemberEntity, ProjectSettingsSchema } from '../api/base';
@@ -15,6 +10,7 @@ import { ClientManager } from '../collaboration/clientManager';
 import { EventBus } from '../utils/eventBus';
 import { SCMCollectionProvider } from '../scm/scmCollectionProvider';
 import { ExtendedBaseAPI, ProjectLinkedFileProvider, UrlLinkedFileProvider } from '../api/extendedBase';
+import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
 
 const __OUTPUTS_ID = `${ROOT_NAME}-outputs`;
 
@@ -645,12 +641,14 @@ export class VirtualFileSystem extends vscode.Disposable {
 
         // Mark dirty and notify so viewers refresh
         this.isDirty = op.length > 0;
+        console.log('[notify Changed]', destUri.toString())
         setTimeout(() => this.notify([{ type: vscode.FileChangeType.Changed, uri: destUri }]), 10);
     }
 
     async writeFile(uri: vscode.Uri, content: Uint8Array, create: boolean, overwrite: boolean) {
+        console.log('[provider.writeFile]', uri.toString());
         // Merge write bypass: if this write was triggered by our RESULT copy, skip processing.
-        if (merge.isBypassed(uri)) return;
+        // if (merge.isBypassed(uri)) return;
 
         const { fileType, fileEntity } = await this._resolveUri(uri);
 
@@ -670,14 +668,30 @@ export class VirtualFileSystem extends vscode.Disposable {
             const remote = doc.remoteCache;                     // REMOTE
             const relPath = (await this._resolveUri(uri)).fileEntity?.name ?? uri.path;
 
-            // One-liner: handles clean merge or launches editor + writes back to VFS
-            const mergedText = await merge.resolveAndWriteForVfs({
+            // 1) Resolve conflicts to TEXT ONLY (no write)
+            const mergedText = await merge.resolveWithEditorIfNeeded({
                 title: `Merging ${relPath}`,
-                base: base, local: local, remote: remote,
-                destUri: uri,
+                base,
+                local,
+                remote,
             });
 
-            // Push upstream + advance caches/base
+            // Try to mirror to a local replica (only if a replica is active)
+            // Build the same relPath format your replica uses (`/foo/bar.tex`)
+            const { pathParts } = parseUri(uri);
+            if (pathParts.at(-1) === '') pathParts.pop();
+            const replicaRelPath = '/' + pathParts.join('/');
+
+            // Map to a workspace file if `.overleaf/settings.json` exists
+            const localUri = await LocalReplicaSCMProvider.pathToUri(replicaRelPath);
+            if (localUri) {
+                await vscode.workspace.fs.writeFile(
+                    localUri,
+                    new TextEncoder().encode(mergedText)
+                );
+            }
+
+            // Apply merge: send OT update + advance caches + notify listeners
             await this.applyResolvedMerge(doc, uri, mergedText);
 
             return;

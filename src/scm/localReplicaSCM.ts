@@ -267,6 +267,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private async applySync(action:'push'|'pull', type: 'update'|'delete', relPath:string, fromUri: vscode.Uri, toUri: vscode.Uri) {
         this.status = {status: action, message: `${type}: ${relPath}`};
+        console.log("APPLYSYNC")
 
         await (async () => {
             if (type==='delete') {
