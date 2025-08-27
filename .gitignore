@@ -5,3 +5,5 @@ out
 *.vsix
 
 **/vendor/**
+
+.DS_Store
