@@ -257,30 +257,40 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return vscode.Uri.joinPath(this.baseStoreRoot(), ...segs);
     }
 
-    // --- Disk I/O for BASE snapshots -------------------------------------------
+    // --- Helper: only snapshot files that aren't ignored -------------------------
+    /** Return true iff this file should be snapshotted (i.e., not ignored). */
+    private shouldSnapshot(relPath: string): boolean {
+        return !this.matchIgnorePatterns(relPath);
+    }
+
+    // --- Disk I/O for BASE snapshots (now honoring ignore patterns) --------------
     private async ensureBaseStore(): Promise<void> {
-        try { await vscode.workspace.fs.createDirectory(this.baseStoreRoot()); } catch { }
+        try { await vscode.workspace.fs.createDirectory(this.baseStoreRoot()); } catch { /* noop */ }
     }
 
     private async writeBaseSnapshot(relPath: string, bytes: Uint8Array): Promise<void> {
+        if (!this.shouldSnapshot(relPath)) return;                  // ⛔ ignored → no snapshot
         await this.ensureBaseStore();
         await vscode.workspace.fs.createDirectory(this.baseSnapDirUri(relPath)); // mkdir -p
         await vscode.workspace.fs.writeFile(this.baseSnapUri(relPath), bytes);
     }
 
     private async readBaseSnapshot(relPath: string): Promise<Uint8Array | undefined> {
+        if (!this.shouldSnapshot(relPath)) return undefined;        // ⛔ ignored → pretend none
         try {
-            const data = await vscode.workspace.fs.readFile(this.baseSnapUri(relPath));
-            return data;
-        } catch { return undefined; }
+            return await vscode.workspace.fs.readFile(this.baseSnapUri(relPath));
+        } catch {
+            return undefined;
+        }
     }
 
     private async deleteBaseSnapshot(relPath: string): Promise<void> {
-        try { await vscode.workspace.fs.delete(this.baseSnapUri(relPath)); } catch { }
+        if (!this.shouldSnapshot(relPath)) return;                  // ⛔ ignored → nothing to delete
+        try { await vscode.workspace.fs.delete(this.baseSnapUri(relPath)); } catch { /* noop */ }
     }
 
+    /** Load snapshots from disk into memory (skip ignored files). */
     private async loadAllBaseSnapshots(): Promise<void> {
-        // BFS walk .overleaf/base and load into memory (this.baseCache)
         const root = this.baseStoreRoot();
         try { await vscode.workspace.fs.stat(root); } catch { return; } // no store yet
 
@@ -293,9 +303,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 if (type === vscode.FileType.Directory) {
                     q.push({ uri: child, prefix: prefix + name + '/' });
                 } else if (type === vscode.FileType.File) {
-                    const bytes = await vscode.workspace.fs.readFile(child);
                     const relPath = prefix + name; // leading '/'
-                    this.baseCache[relPath] = bytes;
+                    if (this.shouldSnapshot(relPath)) {              // ✅ only load non-ignored
+                        try {
+                            const bytes = await vscode.workspace.fs.readFile(child);
+                            this.baseCache[relPath] = bytes;
+                        } catch { /* ignore unreadable */ }
+                    }
                 }
             }
         }
@@ -314,6 +328,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         vfsUri: vscode.Uri,
         _origin: 'pull' | 'push' | 'bulk' = 'bulk'
     ): Promise<'noop' | 'merged'> {
+        if (this.matchIgnorePatterns(relPath)) return 'noop';
+        
         const td = new TextDecoder();
         const te = new TextEncoder();
 
