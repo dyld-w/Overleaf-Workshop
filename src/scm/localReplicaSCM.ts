@@ -1,5 +1,4 @@
 import * as vscode from 'vscode';
-import * as DiffMatchPatch from 'diff-match-patch';
 import { minimatch } from 'minimatch';
 import { BaseSCM, CommitItem, SettingItem } from ".";
 import { VirtualFileSystem, parseUri } from '../core/remoteFileSystemProvider';
@@ -185,77 +184,6 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
         this.setBypassCache(relPath, content, action);
         return true;
-    }
-
-    private async overwrite(root: string = '/'): Promise<boolean | undefined> {
-        return await vscode.window.withProgress({
-            location: vscode.ProgressLocation.Notification,
-            title: vscode.l10n.t('Sync Files'),
-            cancellable: true,
-        }, async (progress, token) => {
-            // breadth-first search for the files
-            const files: [string, string][] = [];
-            const queue: string[] = [root];
-            while (queue.length !== 0) {
-                const nextRoot = queue.shift();
-                const vfsUri = this.vfs.pathToUri(nextRoot!);
-                const items = await vscode.workspace.fs.readDirectory(vfsUri);
-                if (token.isCancellationRequested) { return undefined; }
-                //
-                for (const [name, type] of items) {
-                    const relPath = nextRoot + name;
-                    if (this.matchIgnorePatterns(relPath)) {
-                        continue;
-                    }
-                    if (type === vscode.FileType.Directory) {
-                        queue.push(relPath + '/');
-                    } else {
-                        files.push([name, relPath]);
-                    }
-                }
-            }
-
-            // sync the files
-            const total = files.length;
-            for (let i = 0; i < total; i++) {
-                const [name, relPath] = files[i];
-                const vfsUri = this.vfs.pathToUri(relPath);
-                if (token.isCancellationRequested) { return false; }
-                progress.report({ increment: 100 / total, message: relPath });
-                //
-                const baseContent = this.baseCache[relPath];
-                const localContent = await this.readFile(relPath);
-                const remoteContent = await vscode.workspace.fs.readFile(vfsUri);
-                if (baseContent === undefined || localContent === undefined) {
-                    this.setBypassCache(relPath, remoteContent);
-                    await this.writeFile(relPath, remoteContent);
-                    // persist BASE snapshot
-                    this.baseCache[relPath] = remoteContent;
-                    await this.writeBaseSnapshot(relPath, remoteContent);
-                } else {
-                    const dmp = new DiffMatchPatch();
-                    const baseContentStr = new TextDecoder().decode(baseContent);
-                    const localContentStr = new TextDecoder().decode(localContent);
-                    const remoteContentStr = new TextDecoder().decode(remoteContent);
-                    // merge local and remote changes
-                    const localPatches = dmp.patch_make(baseContentStr, localContentStr);
-                    const remotePatches = dmp.patch_make(baseContentStr, remoteContentStr);
-                    const [mergedContentStr, _results] = dmp.patch_apply(remotePatches, localContentStr);
-                    // write the merged content to local
-                    const mergedContent = new TextEncoder().encode(mergedContentStr);
-                    await this.writeFile(relPath, mergedContent);
-                    // write the merged content to remote
-                    if (localPatches.length !== 0) {
-                        await vscode.workspace.fs.writeFile(vfsUri, mergedContent);
-                    }
-                    // persist BASE snapshot
-                    this.baseCache[relPath] = mergedContent;
-                    await this.writeBaseSnapshot(relPath, mergedContent);
-                }
-            }
-
-            return true;
-        });
     }
 
     private bypassSync(action: 'push' | 'pull', type: 'update' | 'delete', relPath: string, content?: Uint8Array): boolean {
