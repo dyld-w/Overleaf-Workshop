@@ -11,6 +11,7 @@ import { EventBus } from '../utils/eventBus';
 import { SCMCollectionProvider } from '../scm/scmCollectionProvider';
 import { ExtendedBaseAPI, ProjectLinkedFileProvider, UrlLinkedFileProvider } from '../api/extendedBase';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
+import type { EventsHandler } from '../api/socketio';
 
 const __OUTPUTS_ID = `${ROOT_NAME}-outputs`;
 
@@ -163,6 +164,51 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (this.root) return this.root;
         if (!this.initializing) this.initializing = this.initializingPromise;
         return this.initializing;
+    }
+
+    private lifecycleHooked = false;
+    private _onDidDisconnect = new vscode.EventEmitter<void>();
+    private _onDidReconnect = new vscode.EventEmitter<void>();
+    public readonly onDidDisconnect = this._onDidDisconnect.event;
+    public readonly onDidReconnect = this._onDidReconnect.event;
+
+    /** Call once to bridge socket -> VS Code events (idempotent). */
+    private ensureSocketLifecycleBridge() {
+        if (this.lifecycleHooked) return;
+        this.lifecycleHooked = true;
+
+        // Use the SocketIOAPI's handler API exactly once
+        this.socket.updateEventHandlers({
+            onDisconnected: () => {
+                try { this._onDidDisconnect.fire(); } catch { }
+            },
+            onConnectionAccepted: (_publicId: string) => {
+                try { this._onDidReconnect.fire(); } catch { }
+            },
+        });
+
+        // If you want to be extra-safe with the EventBus (used in v2 path),
+        // bump its limit or just leave it—since we register once now:
+        try {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (EventBus as any).setMaxListeners?.(0); // optional: disable max limit
+        } catch { }
+    }
+
+    /** Public helper so other classes can subscribe without touching the raw socket. */
+    public onSocketLifecycle(handlers: { onDisconnected?: () => void; onReconnected?: () => void }): vscode.Disposable {
+        this.ensureSocketLifecycleBridge();
+        const subs: vscode.Disposable[] = [];
+        if (handlers.onDisconnected) subs.push(this.onDidDisconnect(handlers.onDisconnected));
+        if (handlers.onReconnected) subs.push(this.onDidReconnect(handlers.onReconnected));
+        return vscode.Disposable.from(...subs);
+    }
+
+    dispose() {
+        // …
+        try { this._onDidDisconnect.dispose(); } catch { }
+        try { this._onDidReconnect.dispose(); } catch { }
+        super.dispose();
     }
 
     private get initializingPromise(): Promise<ProjectEntity> {
@@ -646,9 +692,12 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async writeFile(uri: vscode.Uri, content: Uint8Array, create: boolean, overwrite: boolean) {
+        if (merge.isBypassed?.(uri)) {
+            console.log('[provider.writeFile] BYPASSED', uri.toString());
+            return;
+        }
+
         console.log('[provider.writeFile]', uri.toString());
-        // Merge write bypass: if this write was triggered by our RESULT copy, skip processing.
-        // if (merge.isBypassed(uri)) return;
 
         const { fileType, fileEntity } = await this._resolveUri(uri);
 
