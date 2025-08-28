@@ -22,36 +22,57 @@ export async function openMergeEditorSmart(opts: {
     const dir = path.join(os.tmpdir(), 'overleaf-merge');
     await fs.mkdir(dir, { recursive: true });
     const stem = opts.title.replace(/[\/\\]/g, '__');
-    const baseP = path.join(dir, `${stem}.BASE.txt`);
-    const localP = path.join(dir, `${stem}.LOCAL.txt`);
+    const baseP   = path.join(dir, `${stem}.BASE.txt`);
+    const localP  = path.join(dir, `${stem}.LOCAL.txt`);
     const remoteP = path.join(dir, `${stem}.REMOTE.txt`);
     const resultP = path.join(dir, `${stem}.RESULT.txt`);
 
-    await fs.writeFile(baseP, normalizeForMerge(opts.base));
-    await fs.writeFile(localP, normalizeForMerge(opts.local));
+    await fs.writeFile(baseP,   normalizeForMerge(opts.base));
+    await fs.writeFile(localP,  normalizeForMerge(opts.local));
     await fs.writeFile(remoteP, normalizeForMerge(opts.remote));
     await fs.writeFile(resultP, normalizeForMerge(opts.local)); // seed RESULT with LOCAL
 
     const resultUri = vscode.Uri.file(resultP);
 
+    // ── Autosave suspension (workspace-scoped) ─────────────────────────────────
+    type AutoSave = 'off' | 'afterDelay' | 'onFocusChange' | 'onWindowChange';
+    const filesCfg = vscode.workspace.getConfiguration('files');
+    const originalAutoSave = filesCfg.get<AutoSave>('autoSave', 'off');
+    let restored = false;
+    const restoreAutoSave = async () => {
+        if (restored) return;
+        restored = true;
+        try { await filesCfg.update('autoSave', originalAutoSave, vscode.ConfigurationTarget.Workspace); } catch {}
+    };
+    if (originalAutoSave !== 'off') {
+        try { await filesCfg.update('autoSave', 'off', vscode.ConfigurationTarget.Workspace); } catch {}
+    }
+
+    // (Optional) soft-guard: nudge if something tries to autosave RESULT anyway.
+    const willSaveSub = vscode.workspace.onWillSaveTextDocument(e => {
+        if (e.document.uri.fsPath !== resultP) return;
+        if (e.reason !== vscode.TextDocumentSaveReason.Manual) {
+            vscode.window.showWarningMessage(
+                'Autosave is disabled for merge results. Press **Save** when you finish resolving.'
+            );
+        }
+    });
+
     // Helper to (re)open the merge editor
     async function openMergeEditorOnce() {
         const codeBin = await resolveCodeCli();
         if (codeBin) {
-            // External VS Code instance (or same, via --reuse-window)
             execFile(codeBin, ['--merge', localP, remoteP, baseP, resultP, '--reuse-window']);
         } else {
-            // Internal fallback
             try {
                 await vscode.commands.executeCommand('_open.mergeEditor', {
                     title: opts.title,
-                    base: { uri: vscode.Uri.file(baseP), title: 'Base' },
-                    input1: { uri: vscode.Uri.file(localP), title: 'Current (LOCAL)' },
+                    base:   { uri: vscode.Uri.file(baseP),   title: 'Base' },
+                    input1: { uri: vscode.Uri.file(localP),  title: 'Current (LOCAL)' },
                     input2: { uri: vscode.Uri.file(remoteP), title: 'Incoming (REMOTE)' },
                     output: { uri: resultUri },
                 });
             } catch {
-                // Last-ditch fallback: diff view
                 await vscode.commands.executeCommand(
                     'vscode.diff',
                     vscode.Uri.file(localP),
@@ -65,50 +86,51 @@ export async function openMergeEditorSmart(opts: {
     await openMergeEditorOnce();
 
     return new Promise<string>((resolve, reject) => {
-        let finished = false;      // guarantees single resolve/reject
-        let reOpening = false;     // ignore close events caused by our own reopen
-        let savedOnce = false;     // track if RESULT was ever saved
+        let finished  = false;  // single settle
+        let reOpening = false;  // ignore our own reopen close events
+        let savedOnce = false;  // track if RESULT was saved
 
-        const disposables: vscode.Disposable[] = [];
+        const disposables: vscode.Disposable[] = [willSaveSub];
 
-        function cleanupTempFiles() {
+        const cleanupTempFiles = () => {
             for (const p of [baseP, localP, remoteP, resultP]) {
-                fs.rm(p).catch(() => { /* ignore */ });
+                fs.rm(p).catch(() => {});
             }
-        }
-
-        function cleanup() {
+        };
+        const cleanup = async () => {
             disposables.splice(0).forEach(d => d.dispose());
-        }
+            await restoreAutoSave();
+        };
 
         // SAVE → success path
         disposables.push(
             vscode.workspace.onDidSaveTextDocument(async (doc) => {
-                if (finished) return;
-                if (doc.uri.fsPath !== resultP) return;
+                if (finished || doc.uri.fsPath !== resultP) return;
                 savedOnce = true;
                 finished = true;
-                cleanup();
                 try {
                     const bytes = await vscode.workspace.fs.readFile(resultUri);
                     resolve(new TextDecoder().decode(bytes));
                 } finally {
+                    await cleanup();
                     cleanupTempFiles();
                 }
             })
         );
 
-        // CLOSE → intercept and offer to return or discard
+        // CLOSE → warn, allow return to editor, or cancel (reject)
         disposables.push(
             vscode.workspace.onDidCloseTextDocument(async (doc) => {
-                if (finished) return;
-                if (reOpening) return;                       // ignore our own reopen
-                if (doc.uri.fsPath !== resultP) return;      // only care about RESULT
+                if (finished || reOpening || doc.uri.fsPath !== resultP) return;
 
-                // If they already saved once, allow close silently (we're likely resolved).
-                if (savedOnce) return;
+                // If they already saved once, just restore autosave and exit quietly.
+                if (savedOnce) {
+                    finished = true;
+                    await cleanup();
+                    cleanupTempFiles();
+                    return;
+                }
 
-                // Show modal warn with choices
                 const choice = await vscode.window.showWarningMessage(
                     `You are closing "${opts.title}" without saving the merge result.\n\n` +
                     `If you proceed, conflicting changes may be lost or applied incorrectly.\n\n` +
@@ -119,27 +141,25 @@ export async function openMergeEditorSmart(opts: {
                 );
 
                 if (choice === 'Return to merge') {
-                    // Re-open the merge editor and keep waiting for save/close again
                     try {
                         reOpening = true;
                         await openMergeEditorOnce();
                     } finally {
-                        // small delay to avoid racing the just-opened editor’s lifecycle
                         setTimeout(() => { reOpening = false; }, 200);
                     }
-                    return; // keep the promise pending
+                    return; // keep waiting
                 }
 
-                // Close anyway → treat as cancel/abort
+                // Close anyway → treat as cancel
                 finished = true;
-                cleanup();
+                await cleanup();
                 cleanupTempFiles();
                 reject(new Error('Merge editor closed without saving'));
             })
         );
 
         vscode.window.showInformationMessage(
-            'Merge editor opened. Save the RESULT to finish.'
+            'Merge editor opened. Autosave is temporarily disabled. Save the RESULT to finish.'
         );
     });
 }
