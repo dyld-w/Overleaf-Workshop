@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write # needed for creating releases & uploading assets
+  contents: write  # needed for creating releases & uploading assets
 
 jobs:
   build_and_release:
@@ -33,22 +33,46 @@ jobs:
 
       - name: Package VSIX (+ checksum)
         id: pkg
+        shell: bash
         run: |
           SHORT_SHA=$(git rev-parse --short HEAD)
           BASE_VERSION=$(jq -r '.version' package.json)
           jq --arg v "${BASE_VERSION}-${SHORT_SHA}" '.version=$v' package.json > package.tmp && mv package.tmp package.json
 
-          vsce package --out dist/
-          mv dist/*.vsix overleaf-workshop-enhanced.vsix
-          sha256sum overleaf-workshop-enhanced.vsix > overleaf-workshop-enhanced.vsix.sha256
+          # Build; outputs a single *.vsix in cwd (no --out flag)
+          vsce package
 
-      # Only create a release on pushes (not on PRs)
+          # Find the generated file
+          GEN_VSIX=$(ls -1 *.vsix | tail -n1)
+
+          # Make a stable-named copy for the releases/latest URL
+          STABLE_VSIX="overleaf-workshop-enhanced.vsix"
+          cp "$GEN_VSIX" "$STABLE_VSIX"
+
+          # Checksum the stable file
+          sha256sum "$STABLE_VSIX" > "${STABLE_VSIX}.sha256"
+
+          echo "gen=$GEN_VSIX" >> "$GITHUB_OUTPUT"
+          echo "stable=$STABLE_VSIX" >> "$GITHUB_OUTPUT"
+          echo "stable_sha=${STABLE_VSIX}.sha256" >> "$GITHUB_OUTPUT"
+
+      # Optional: upload artifacts for PRs and for debugging
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vsix-build-${{ github.run_id }}
+          path: |
+            ${{ steps.pkg.outputs.gen }}
+            ${{ steps.pkg.outputs.stable }}
+            ${{ steps.pkg.outputs.stable_sha }}
+
+      # Only create a Release on pushes (not on PRs)
       - name: Create GitHub Release
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            overleaf-workshop-enhanced.vsix
-            overleaf-workshop-enhanced.vsix.sha256
+            ${{ steps.pkg.outputs.stable }}
+            ${{ steps.pkg.outputs.stable_sha }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
