@@ -329,7 +329,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         _origin: 'pull' | 'push' | 'bulk' = 'bulk'
     ): Promise<'noop' | 'merged'> {
         if (this.matchIgnorePatterns(relPath)) return 'noop';
-        
+
         const td = new TextDecoder();
         const te = new TextEncoder();
 
@@ -485,11 +485,32 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         if (!vfsUri) return;
         await this.applySync('push', type, relPath, localUri, vfsUri);
     }
-
-    private async initWatch() {
-        // write ".overleaf/settings.json" if it does not exist
+    private async ensureSettingsJson(): Promise<void> {
+        // .overleaf/settings.json
         const overleafDir = vscode.Uri.joinPath(this.baseUri, '.overleaf');
         const settingUri = vscode.Uri.joinPath(overleafDir, 'settings.json');
+
+        // If it already exists, we're done
+        try { await vscode.workspace.fs.stat(settingUri); return; } catch { }
+
+        // Ensure the directory exists
+        try { await vscode.workspace.fs.createDirectory(overleafDir); } catch { }
+
+        // Prepare contents
+        const settings = {
+            uri: this.vfs.origin.toString(),
+            serverName: this.vfs.serverName,
+            enableCompileNPreview: false,
+            projectName: this.vfs.projectName,
+        };
+
+        // Write as Uint8Array (NOT Buffer)
+        const bytes = new TextEncoder().encode(JSON.stringify(settings, null, 4));
+        await vscode.workspace.fs.writeFile(settingUri, bytes);
+    }
+    private async initWatch() {
+        // write ".overleaf/settings.json" if it does not exist
+        await this.ensureSettingsJson();
 
         this.vfsWatcher = vscode.workspace.createFileSystemWatcher(
             new vscode.RelativePattern(this.vfs.origin, '**/*')
