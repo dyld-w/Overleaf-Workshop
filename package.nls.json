@@ -1,6 +1,6 @@
 {
-    "extension.displayName": "Overleaf Workshop",
-    "extension.description": "Open Overleaf/ShareLaTex projects in VSCode, with full collaboration support.",
+    "extension.displayName": "Overleaf Workshop - Enhanced",
+    "extension.description": "Open Overleaf/ShareLaTex projects in VSCode, with full collaboration support. Uses the `git` and `code` CLIs to detect conflicts and open the merge editor.",
 
     "commands.remoteFileSystem.refreshLinkedFile.title": "Overleaf: Refresh File",
     "commands.remoteFileSystem.createLinkedFile.title": "Overleaf: Import File ...",

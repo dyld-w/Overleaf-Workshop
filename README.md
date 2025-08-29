@@ -8,6 +8,61 @@
 
 Open Overleaf (ShareLatex) projects in VSCode, with full collaboration support.
 
+## NOTE
+This is a forked version of the excellent [Overleaf Workshop](https://github.com/iamhyc/Overleaf-Workshop) project that [iamhyc](https://github.com/iamhyc/Overleaf-Workshop) started. The core difference that this version has more robust conflict resolution to better suit my use-case. More specifically, it invokes the `git` and `code` CLIs for detecting merge conflicts and launching a 3-way merge editor respectively.
+
+## Fetching New Latest Version
+**macOS**
+```
+# Download latest release asset + checksum
+curl -L -O https://github.com/dyld-w/Overleaf-Workshop/releases/latest/download/overleaf-workshop-enhanced.vsix
+curl -L -O https://github.com/dyld-w/Overleaf-Workshop/releases/latest/download/overleaf-workshop-enhanced.vsix.sha256
+
+# Verify checksum (should print "OK")
+shasum -a 256 -c overleaf-workshop-enhanced.vsix.sha256
+
+# Install into VS Code (use full path to `code` if needed)
+code --install-extension overleaf-workshop-enhanced.vsix
+```
+
+**Linux**
+```
+# Download latest release asset + checksum
+curl -L -O https://github.com/dyld-w/Overleaf-Workshop/releases/latest/download/overleaf-workshop-enhanced.vsix
+curl -L -O https://github.com/dyld-w/Overleaf-Workshop/releases/latest/download/overleaf-workshop-enhanced.vsix.sha256
+
+# Verify checksum (should print "OK")
+sha256sum -c overleaf-workshop-enhanced.vsix.sha256
+
+# Install into VS Code
+code --install-extension overleaf-workshop-enhanced.vsix
+```
+
+**Windows (PowerShell)**
+```
+# Download latest release asset + checksum
+Invoke-WebRequest `
+  -Uri "https://github.com/dyld-w/Overleaf-Workshop/releases/latest/download/overleaf-workshop-enhanced.vsix" `
+  -OutFile "overleaf-workshop-enhanced.vsix"
+
+Invoke-WebRequest `
+  -Uri "https://github.com/dyld-w/Overleaf-Workshop/releases/latest/download/overleaf-workshop-enhanced.vsix.sha256" `
+  -OutFile "overleaf-workshop-enhanced.vsix.sha256"
+
+# Verify checksum
+Get-FileHash overleaf-workshop-enhanced.vsix -Algorithm SHA256 | ForEach-Object {
+    $expected = Get-Content overleaf-workshop-enhanced.vsix.sha256
+    if ($_.Hash.ToLower() -eq $expected.Split()[0].ToLower()) {
+        "Checksum OK"
+    } else {
+        throw "Checksum MISMATCH!"
+    }
+}
+
+# Install into VS Code
+code --install-extension .\overleaf-workshop-enhanced.vsix
+```
+
 ### User Guide
 
 The full user guide is available at [GitHub Wiki](https://github.com/iamhyc/Overleaf-Workshop/wiki).

@@ -1,15 +1,18 @@
 {
-  "name": "overleaf-workshop",
+  "name": "overleaf-workshop-enhanced",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.15.5",
+  "version": "0.16.0",
   "icon": "resources/icons/app_icon.png",
   "author": {
-    "name": "iamhyc",
-    "email": "sudofree@163.com"
+    "name": "dyld-w"
   },
-  "publisher": "iamhyc",
+  "publisher": "dyld-w",
   "contributors": [
+    {
+      "name": "dyld-w",
+      "url": "https://github.com/dyld-w"
+    },
     {
       "name": "iamhyc",
       "email": "sudofree@163.com",
@@ -35,10 +38,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/iamhyc/overleaf-workshop"
+    "url": "https://github.com/dyld-w/overleaf-workshop"
   },
   "bugs": {
-    "url": "https://github.com/iamhyc/overleaf-workshop/issues"
+    "url": "https://github.com/dyld-w/overleaf-workshop/issues"
   },
   "engines": {
     "vscode": "^1.80.0"
