@@ -1,112 +1,54 @@
 # .github/workflows/build-and-release.yml
-name: Build & Release Overleaf Workshop Enhanced
+name: Build & Release VSIX
 
 on:
   push:
     branches: [build-and-release]
-    tags:
-      - 'v*'
   pull_request:
     branches: [build-and-release]
-    types: [opened, synchronize, reopened] 
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
 
 permissions:
-  contents: write      # needed for creating releases & uploading assets
-  packages: write
-  actions: read
-
-concurrency:
-  group: build-and-release-${{ github.ref }}
-  cancel-in-progress: true
+  contents: write # needed for creating releases & uploading assets
 
 jobs:
-  package:
-    name: Package VSIX
+  build_and_release:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: 20
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           npm ci
-          if [ -d "views/chat-view" ]; then
-            (cd views/chat-view && npm ci)
-          fi
+          if [ -d "views/chat-view" ]; then (cd views/chat-view && npm ci); fi
 
       - name: Install vsce
         run: npm i -g @vscode/vsce
 
-      - name: Bump version metadata and package
+      - name: Package VSIX (+ checksum)
         id: pkg
-        shell: bash
         run: |
-          # Read current version
-          BASE_VERSION=$(jq -r '.version' package.json)
           SHORT_SHA=$(git rev-parse --short HEAD)
+          BASE_VERSION=$(jq -r '.version' package.json)
+          jq --arg v "${BASE_VERSION}-${SHORT_SHA}" '.version=$v' package.json > package.tmp && mv package.tmp package.json
 
-          # Append -<sha> for CI builds (keeps semver-ish but unique)
-          NEW_VERSION="${BASE_VERSION}-${SHORT_SHA}"
-          jq --arg v "$NEW_VERSION" '.version=$v' package.json > package.tmp.json && mv package.tmp.json package.json
-
-          # Build the VSIX
           vsce package --out dist/
+          mv dist/*.vsix overleaf-workshop-enhanced.vsix
+          sha256sum overleaf-workshop-enhanced.vsix > overleaf-workshop-enhanced.vsix.sha256
 
-          # Normalize the filename for the stable “latest” URL you’ll publish
-          VSIX_OUT="overleaf-workshop-enhanced.vsix"
-          mv dist/*.vsix "$VSIX_OUT"
-
-          # Produce checksum
-          sha256sum "$VSIX_OUT" > "${VSIX_OUT}.sha256"
-
-          echo "vsix=$VSIX_OUT" >> "$GITHUB_OUTPUT"
-          echo "sha=${VSIX_OUT}.sha256" >> "$GITHUB_OUTPUT"
-          echo "ver=$NEW_VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Upload artifacts (VSIX + SHA256)
-        uses: actions/upload-artifact@v4
-        with:
-          name: overleaf-workshop-enhanced-${{ steps.pkg.outputs.ver }}
-          path: |
-            ${{ steps.pkg.outputs.vsix }}
-            ${{ steps.pkg.outputs.sha }}
-          if-no-files-found: error
-          retention-days: 14
-
-  release:
-    name: Create GitHub Release (on tag)
-    runs-on: ubuntu-latest
-    needs: [package]
-    if: startsWith(github.ref, 'refs/tags/v')
-    steps:
-      - name: Download packaged artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: overleaf-workshop-enhanced-${{ needs.package.outputs.ver }}
-          path: dist
-        # If you see "missing artifact" on the first run, fallback to a glob:
-        # with:
-        #   path: dist
-
-      - name: Find built files
-        id: find
-        run: |
-          VSIX=$(ls dist/*.vsix | head -n1)
-          SHA=$(ls dist/*.sha256 | head -n1)
-          echo "vsix=$VSIX" >> "$GITHUB_OUTPUT"
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-
-      - name: Create/Update GitHub Release
+      # Only create a release on pushes (not on PRs)
+      - name: Create GitHub Release
+        if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            ${{ steps.find.outputs.vsix }}
-            ${{ steps.find.outputs.sha }}
+            overleaf-workshop-enhanced.vsix
+            overleaf-workshop-enhanced.vsix.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
