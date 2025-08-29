@@ -22,13 +22,13 @@ export async function openMergeEditorSmart(opts: {
     const dir = path.join(os.tmpdir(), 'overleaf-merge');
     await fs.mkdir(dir, { recursive: true });
     const stem = opts.title.replace(/[\/\\]/g, '__');
-    const baseP   = path.join(dir, `${stem}.BASE.txt`);
-    const localP  = path.join(dir, `${stem}.LOCAL.txt`);
+    const baseP = path.join(dir, `${stem}.BASE.txt`);
+    const localP = path.join(dir, `${stem}.LOCAL.txt`);
     const remoteP = path.join(dir, `${stem}.REMOTE.txt`);
     const resultP = path.join(dir, `${stem}.RESULT.txt`);
 
-    await fs.writeFile(baseP,   normalizeForMerge(opts.base));
-    await fs.writeFile(localP,  normalizeForMerge(opts.local));
+    await fs.writeFile(baseP, normalizeForMerge(opts.base));
+    await fs.writeFile(localP, normalizeForMerge(opts.local));
     await fs.writeFile(remoteP, normalizeForMerge(opts.remote));
     await fs.writeFile(resultP, normalizeForMerge(opts.local)); // seed RESULT with LOCAL
 
@@ -42,10 +42,10 @@ export async function openMergeEditorSmart(opts: {
     const restoreAutoSave = async () => {
         if (restored) return;
         restored = true;
-        try { await filesCfg.update('autoSave', originalAutoSave, vscode.ConfigurationTarget.Workspace); } catch {}
+        try { await filesCfg.update('autoSave', originalAutoSave, vscode.ConfigurationTarget.Workspace); } catch { }
     };
     if (originalAutoSave !== 'off') {
-        try { await filesCfg.update('autoSave', 'off', vscode.ConfigurationTarget.Workspace); } catch {}
+        try { await filesCfg.update('autoSave', 'off', vscode.ConfigurationTarget.Workspace); } catch { }
     }
 
     // (Optional) soft-guard: nudge if something tries to autosave RESULT anyway.
@@ -67,8 +67,8 @@ export async function openMergeEditorSmart(opts: {
             try {
                 await vscode.commands.executeCommand('_open.mergeEditor', {
                     title: opts.title,
-                    base:   { uri: vscode.Uri.file(baseP),   title: 'Base' },
-                    input1: { uri: vscode.Uri.file(localP),  title: 'Current (LOCAL)' },
+                    base: { uri: vscode.Uri.file(baseP), title: 'Base' },
+                    input1: { uri: vscode.Uri.file(localP), title: 'Current (LOCAL)' },
                     input2: { uri: vscode.Uri.file(remoteP), title: 'Incoming (REMOTE)' },
                     output: { uri: resultUri },
                 });
@@ -86,7 +86,7 @@ export async function openMergeEditorSmart(opts: {
     await openMergeEditorOnce();
 
     return new Promise<string>((resolve, reject) => {
-        let finished  = false;  // single settle
+        let finished = false;  // single settle
         let reOpening = false;  // ignore our own reopen close events
         let savedOnce = false;  // track if RESULT was saved
 
@@ -94,13 +94,32 @@ export async function openMergeEditorSmart(opts: {
 
         const cleanupTempFiles = () => {
             for (const p of [baseP, localP, remoteP, resultP]) {
-                fs.rm(p).catch(() => {});
+                fs.rm(p).catch(() => { });
             }
         };
         const cleanup = async () => {
             disposables.splice(0).forEach(d => d.dispose());
-            await restoreAutoSave();
+            await restoreAutoSave(); // ← ALWAYS restore here
         };
+
+        // Utility: does a Tab refer to our RESULT?
+        function tabTargetsResult(tab: vscode.Tab): boolean {
+            const input: any = tab.input;
+            if (!input) return false;
+
+            // Common cases
+            if ('uri' in input && input.uri instanceof vscode.Uri) {
+                return (input.uri as vscode.Uri).fsPath === resultP;           // TabInputText
+            }
+            if ('modified' in input && input.modified instanceof vscode.Uri) { // rare
+                return (input.modified as vscode.Uri).fsPath === resultP;
+            }
+            // Merge editor input (VS Code ≥1.93 has a specific merge input)
+            if ('result' in input && input.result && input.result.uri instanceof vscode.Uri) {
+                return (input.result.uri as vscode.Uri).fsPath === resultP;    // TabInputMerge
+            }
+            return false;
+        }
 
         // SAVE → success path
         disposables.push(
@@ -118,12 +137,14 @@ export async function openMergeEditorSmart(opts: {
             })
         );
 
-        // CLOSE → warn, allow return to editor, or cancel (reject)
+        // TAB CLOSED (covers cases where RESULT doc doesn't fire close)
         disposables.push(
-            vscode.workspace.onDidCloseTextDocument(async (doc) => {
-                if (finished || reOpening || doc.uri.fsPath !== resultP) return;
+            vscode.window.tabGroups.onDidChangeTabs(async (e) => {
+                if (finished || reOpening) return;
+                const closedOurTab = e.closed.some(tabTargetsResult);
+                if (!closedOurTab) return;
 
-                // If they already saved once, just restore autosave and exit quietly.
+                // If already saved once, just restore autosave and exit quietly.
                 if (savedOnce) {
                     finished = true;
                     await cleanup();
@@ -132,9 +153,8 @@ export async function openMergeEditorSmart(opts: {
                 }
 
                 const choice = await vscode.window.showWarningMessage(
-                    `You are closing "${opts.title}" without saving the merge result.\n\n` +
-                    `If you proceed, conflicting changes may be lost or applied incorrectly.\n\n` +
-                    `Do you want to go back and save the RESULT?`,
+                    `You closed "${opts.title}" without saving the merge result.\n\n` +
+                    `Return to the merge to save RESULT, or close anyway.`,
                     { modal: true },
                     'Return to merge',
                     'Close anyway'
@@ -151,6 +171,43 @@ export async function openMergeEditorSmart(opts: {
                 }
 
                 // Close anyway → treat as cancel
+                finished = true;
+                await cleanup();
+                cleanupTempFiles();
+                reject(new Error('Merge editor closed without saving'));
+            })
+        );
+
+        // (Legacy) CLOSE of RESULT text doc → warn/restore
+        disposables.push(
+            vscode.workspace.onDidCloseTextDocument(async (doc) => {
+                if (finished || reOpening || doc.uri.fsPath !== resultP) return;
+
+                if (savedOnce) {
+                    finished = true;
+                    await cleanup();
+                    cleanupTempFiles();
+                    return;
+                }
+
+                const choice = await vscode.window.showWarningMessage(
+                    `You are closing "${opts.title}" without saving the merge result.\n\n` +
+                    `Do you want to go back and save the RESULT?`,
+                    { modal: true },
+                    'Return to merge',
+                    'Close anyway'
+                );
+
+                if (choice === 'Return to merge') {
+                    try {
+                        reOpening = true;
+                        await openMergeEditorOnce();
+                    } finally {
+                        setTimeout(() => { reOpening = false; }, 200);
+                    }
+                    return;
+                }
+
                 finished = true;
                 await cleanup();
                 cleanupTempFiles();
