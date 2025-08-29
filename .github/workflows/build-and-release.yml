@@ -3,19 +3,20 @@ name: Build & Release VSIX
 
 on:
   push:
-    branches:
-      - 'build-and-release'
+    branches: [build-and-release]
+  pull_request:
+    branches: [build-and-release]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
 
 permissions:
-  contents: write      # needed to create releases & upload assets
+  contents: write   # needed for creating tags/releases & uploading assets
 
 jobs:
   build_and_release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref }}
 
       - uses: actions/setup-node@v4
         with:
@@ -34,17 +35,50 @@ jobs:
         run: |
           SHORT_SHA=$(git rev-parse --short HEAD)
           BASE_VERSION=$(jq -r '.version' package.json)
-          jq --arg v "${BASE_VERSION}-${SHORT_SHA}" '.version=$v' package.json > package.tmp && mv package.tmp package.json
+          NEW_VERSION="${BASE_VERSION}-${SHORT_SHA}"
+          jq --arg v "$NEW_VERSION" '.version=$v' package.json > package.tmp && mv package.tmp package.json
 
-          vsce package --out dist/
-          mv dist/*.vsix overleaf-workshop-enhanced.vsix
-          sha256sum overleaf-workshop-enhanced.vsix > overleaf-workshop-enhanced.vsix.sha256
+          vsce package
+          GEN_VSIX=$(ls -1 *.vsix | tail -n1)
+
+          # Stable asset name for releases/latest URL
+          STABLE_VSIX="overleaf-workshop-enhanced.vsix"
+          cp "$GEN_VSIX" "$STABLE_VSIX"
+          sha256sum "$STABLE_VSIX" > "${STABLE_VSIX}.sha256"
+
+          # Tag to use for the Release
+          TAG="v${NEW_VERSION}"
+
+          echo "gen=$GEN_VSIX" >> "$GITHUB_OUTPUT"
+          echo "stable=$STABLE_VSIX" >> "$GITHUB_OUTPUT"
+          echo "stable_sha=${STABLE_VSIX}.sha256" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts (for PRs/debugging)
+        uses: actions/upload-artifact@v4
+        with:
+          name: vsix-build-${{ github.run_id }}
+          path: |
+            ${{ steps.pkg.outputs.gen }}
+            ${{ steps.pkg.outputs.stable }}
+            ${{ steps.pkg.outputs.stable_sha }}
+
+      # Create a tag + release only on pushes (not PRs)
+      - name: Create/Update Git tag
+        if: github.event_name == 'push'
+        run: |
+          git tag -f ${{ steps.pkg.outputs.tag }} ${{ github.sha }}
+          git push -f origin ${{ steps.pkg.outputs.tag }}
 
       - name: Create GitHub Release
+        if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.pkg.outputs.tag }}           # <-- provide the tag
+          target_commitish: ${{ github.sha }}
+          make_latest: true
           files: |
-            overleaf-workshop-enhanced.vsix
-            overleaf-workshop-enhanced.vsix.sha256
+            ${{ steps.pkg.outputs.stable }}
+            ${{ steps.pkg.outputs.stable_sha }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
