@@ -27,6 +27,21 @@ function hashCode(content?: Uint8Array): number {
     return hash;
 }
 
+/** Heuristic: treat file as binary if any NUL is present or a high ratio of control chars exists. */
+function isProbablyBinary(bytes?: Uint8Array): boolean {
+    if (!bytes) return false;
+    const sampleLen = Math.min(bytes.length, 8192);
+    let ctrl = 0;
+    for (let i = 0; i < sampleLen; i++) {
+        const b = bytes[i];
+        if (b === 0x00) return true;                           // NUL byte → very likely binary
+        // Count non-whitespace ASCII control chars (exclude \t, \r, \n)
+        if ((b < 0x20 && b !== 0x09 && b !== 0x0A && b !== 0x0D)) ctrl++;
+    }
+    // If more than ~30% of the sample are control chars, call it binary.
+    return ctrl / sampleLen > 0.30;
+}
+
 /**
  * A SCM which tracks exact the changes from the vfs.
  * It keeps no history versions.
@@ -270,6 +285,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private async writeBaseSnapshot(relPath: string, bytes: Uint8Array): Promise<void> {
         if (!this.shouldSnapshot(relPath)) return;                  // ⛔ ignored → no snapshot
+        if (isProbablyBinary(bytes)) return;                        // ⛔ binary → no snapshot (keeps binaries out of merge base)
         await this.ensureBaseStore();
         await vscode.workspace.fs.createDirectory(this.baseSnapDirUri(relPath)); // mkdir -p
         await vscode.workspace.fs.writeFile(this.baseSnapUri(relPath), bytes);
@@ -307,7 +323,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     if (this.shouldSnapshot(relPath)) {              // ✅ only load non-ignored
                         try {
                             const bytes = await vscode.workspace.fs.readFile(child);
-                            this.baseCache[relPath] = bytes;
+                            // Note: on-disk store should already be text-only due to write guard,
+                            // but keep a defensive binary check just in case.
+                            if (!isProbablyBinary(bytes)) {
+                                this.baseCache[relPath] = bytes;
+                            }
                         } catch { /* ignore unreadable */ }
                     }
                 }
@@ -322,6 +342,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     /** Merge-first reconcile used on reconnect/updates.
      *  Produces a single RESULT, writes only when content differs, and advances BASE.
+     *  BINARY SAFETY: if any side looks binary, skip reconcile entirely (no BASE advance).
      */
     private async reconcileOnReconnect(
         relPath: string,
@@ -344,7 +365,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
         const bytesEq = (a?: Uint8Array, b?: Uint8Array) =>
             !!a && !!b && a.length === b.length && a.every((v, i) => v === b[i]);
-        const looksBinary = (s: string) => /\x00/.test(s);
+
+        // --- BINARY GUARD: if any side appears binary, do nothing on reconcile ---
+        if (isProbablyBinary(baseBytes) || isProbablyBinary(localBytes) || isProbablyBinary(remoteBytes)) {
+            // Intentionally skip merge/editor and do not advance BASE for binaries.
+            console.log(`[reconcile] Skip binary file: ${relPath}`);
+            return 'noop';
+        }
 
         // Nothing anywhere
         if (!localBytes && !remoteBytes) {
@@ -384,25 +411,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             const local = td.decode(localBytes ?? baseBytes);
             const remote = td.decode(remoteBytes ?? baseBytes);
 
-            if (looksBinary(base) || looksBinary(local) || looksBinary(remote)) {
-                if (!bytesEq(localBytes, remoteBytes)) {
-                    const choice = await vscode.window.showWarningMessage(
-                        `${relPath} appears binary and differs. Choose:`,
-                        { modal: true },
-                        'Keep local (push)', 'Accept remote (pull)'
-                    );
-                    resultText = (choice === 'Keep local (push)') ? td.decode(localBytes!) : td.decode(remoteBytes!);
-                } else {
-                    // equal → nothing to do
-                    return 'noop';
-                }
-            } else {
-                // Auto-merge; editor opens if conflicts
-                resultText = await merge.resolveWithEditorIfNeeded({
-                    title: `Merging ${relPath}`,
-                    base, local, remote,
-                });
-            }
+            // Auto-merge; editor opens if conflicts
+            resultText = await merge.resolveWithEditorIfNeeded({
+                title: `Merging ${relPath}`,
+                base, local, remote,
+            });
         }
 
         if (resultText === undefined) return 'noop';
