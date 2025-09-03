@@ -121,6 +121,11 @@ export class VirtualFileSystem extends vscode.Disposable {
     private isDirty: boolean = true;
     private initializing?: Promise<ProjectEntity>;
     private retryConnection: number = 0;
+
+    public wasOffline = false;
+    public offlineModalShown = false;
+    public resolveOfflineNotice?: () => void; // call to close the sticky notice
+
     private outputBuildId?: string;
     private notify: (events: vscode.FileChangeEvent[]) => void;
     private clientManagerItem?: { manager: ClientManager, triggers: vscode.Disposable[] };
@@ -211,18 +216,42 @@ export class VirtualFileSystem extends vscode.Disposable {
         super.dispose();
     }
 
-    private get initializingPromise(): Promise<ProjectEntity> {
-        if (this.retryConnection >= 3) {
-            this.retryConnection = 0;
-            vscode.window.showErrorMessage(
-                vscode.l10n.t('Connection lost: {serverName}', { serverName: this.serverName }),
-                vscode.l10n.t('Reload')
-            ).then((choice) => { if (choice === 'Reload') vscode.commands.executeCommand('workbench.action.reloadWindow'); });
-            this.retryConnection = 0;
-            this.initializing = undefined;
-            throw new Error(vscode.l10n.t('Connection lost'));
+    // ---- on disconnect: modal first, then sticky notice ----
+    private async handleDisconnect() {
+        if (this.offlineModalShown) return;       // only once per outage
+        this.offlineModalShown = true;
+        this.wasOffline = true;
+
+        const title = vscode.l10n.t('You have lost connection to {0}.', this.serverName);
+        const detail = vscode.l10n.t("If you're in a local replica, it is safe to continue editing. You'll be prompted to reconcile your changes upon reconnecting.");
+
+        // 1) Modal — user must dismiss to resume editing
+        await vscode.window.showWarningMessage(title, { modal: true, detail }, vscode.l10n.t('OK'));
+
+        // 2) Sticky, non-error notification that persists while offline
+        if (!this.resolveOfflineNotice) {
+            let resolve!: () => void;
+            const gate = new Promise<void>(r => (resolve = r));
+            this.resolveOfflineNotice = resolve;
+
+            void vscode.window.withProgress(
+                { location: vscode.ProgressLocation.Notification, title },
+                async (progress) => {
+                    progress.report({ message: detail });
+                    await gate; // stays visible until we resolve it on reconnect
+                }
+            );
         }
-        if (this.retryConnection > 0) this.socket.init();
+    }
+
+    private get initializingPromise(): Promise<ProjectEntity> {
+
+        if (this.retryConnection >= 2) {
+            this.handleDisconnect();
+        }
+
+        // Always re-init the socket before trying again
+        this.socket.init();
 
         this.remoteWatch();
         this.root = undefined;

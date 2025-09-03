@@ -107,6 +107,12 @@
     ],
     "commands": [
       {
+        "command": "overleaf-workshop.reconcileNow",
+        "title": "%commands.reconcileNow.title%",
+        "icon": "$(git-merge)",
+        "category": "%extension.displayName%"
+      },
+      {
         "command": "overleaf-workshop.remoteFileSystem.refreshLinkedFile",
         "title": "%commands.remoteFileSystem.refreshLinkedFile.title%",
         "icon": "$(refresh)",
@@ -573,6 +579,11 @@
           "command": "overleaf-workshop.projectHistory.clearSelection",
           "when": "view == overleaf-workshop.projectHistory",
           "group": "navigation@3"
+        },
+        {
+          "command": "overleaf-workshop.reconcileNow",
+          "group": "navigation@9",
+          "when": "overleaf-workshop.activate"
         }
       ],
       "editor/title": [

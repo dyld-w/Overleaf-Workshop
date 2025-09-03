@@ -3,6 +3,8 @@ import { minimatch } from 'minimatch';
 import { BaseSCM, CommitItem, SettingItem } from ".";
 import { VirtualFileSystem, parseUri } from '../core/remoteFileSystemProvider';
 import * as merge from '../merge';
+import { ROOT_NAME } from "../consts";
+import { ActiveReplica } from "../utils/activeReplica";
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
 
@@ -83,6 +85,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         public readonly baseUri: vscode.Uri,
     ) {
         super(vfs, baseUri);
+        ActiveReplica.set(this);
     }
 
     public static async validateBaseUri(uri: string, projectName?: string): Promise<vscode.Uri> {
@@ -480,7 +483,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         try { await this.bulkInFlight; } finally { this.bulkInFlight = undefined; }
     }
 
-    // 3) Gate watchers so they don’t echo during bulk reconciles
+    public async reconcileNow() {
+        console.log("reconcileNow")
+        await this.reconcileAll("/");
+    }
+
     private async syncFromVFS(vfsUri: vscode.Uri, type: 'update' | 'delete') {
         if (this.syncSuspended) return;
         const { pathParts } = parseUri(vfsUri);
@@ -498,6 +505,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         if (!vfsUri) return;
         await this.applySync('push', type, relPath, localUri, vfsUri);
     }
+
     private async ensureSettingsJson(): Promise<void> {
         // .overleaf/settings.json
         const overleafDir = vscode.Uri.joinPath(this.baseUri, '.overleaf');
@@ -521,6 +529,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const bytes = new TextEncoder().encode(JSON.stringify(settings, null, 4));
         await vscode.workspace.fs.writeFile(settingUri, bytes);
     }
+
     private async initWatch() {
         // write ".overleaf/settings.json" if it does not exist
         await this.ensureSettingsJson();
@@ -535,7 +544,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         // Initial merge-first reconcile (no overwrite)
         await this.ensureBaseStore();
         await this.loadAllBaseSnapshots();
-        await this.reconcileAll('/');
+        // await this.reconcileAll('/');
 
         const disposables: vscode.Disposable[] = [
             this.vfsWatcher.onDidChange(async uri => { if (!this.syncSuspended) await this.syncFromVFS(uri, 'update'); }),
@@ -548,11 +557,32 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
         // Subscribe via VFS' bridged events (which hook the socket exactly once)
         const lifecycle = this.vfs.onSocketLifecycle({
-            onDisconnected: () => { this.wasOffline = true; },
+            onDisconnected: () => {
+                console.log("ONDISCONNECTED");
+                this.wasOffline = true;
+            },
             onReconnected: async () => {
-                if (!this.wasOffline) return;
+                console.log("onReconnected");
+                if (!this.wasOffline) return;             // ignore cold starts
                 this.wasOffline = false;
-                await this.reconcileAll('/');
+
+                // Close the persistent offline notice
+                if (this.vfs.resolveOfflineNotice) {
+                    this.vfs.resolveOfflineNotice();
+                    this.vfs.resolveOfflineNotice = undefined;
+                }
+                // Allow next outage to show the modal again
+                this.vfs.offlineModalShown = false;
+
+                const choice = await vscode.window.showInformationMessage(
+                    vscode.l10n.t('Connection restored. Reconcile changes now?'),
+                    vscode.l10n.t('Reconcile now'),
+                    vscode.l10n.t('Ignore')
+                );
+                if (choice === vscode.l10n.t('Reconcile now')) {
+                    await this.reconcileAll('/');
+                }
+                // Ignore = do nothing
             },
         });
 
@@ -578,15 +608,17 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     get triggers(): Promise<vscode.Disposable[]> {
         return this.initWatch().then((watches) => {
-            if (this.vfsWatcher !== undefined && this.localWatcher !== undefined) {
-                return [
-                    this.vfsWatcher,
-                    this.localWatcher,
-                    ...watches,
-                ];
-            } else {
-                return [];
-            }
+            // <- this disposable clears the active replica when triggers are disposed
+            const clearActive = new vscode.Disposable(() => {
+                if (ActiveReplica.get() === this) ActiveReplica.set(undefined);
+            });
+
+            const out: vscode.Disposable[] = [clearActive];
+
+            if (this.vfsWatcher) out.push(this.vfsWatcher);
+            if (this.localWatcher) out.push(this.localWatcher);
+
+            return [...out, ...watches];
         });
     }
 
