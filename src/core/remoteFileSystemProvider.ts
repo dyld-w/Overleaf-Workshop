@@ -11,7 +11,6 @@ import { EventBus } from '../utils/eventBus';
 import { SCMCollectionProvider } from '../scm/scmCollectionProvider';
 import { ExtendedBaseAPI, ProjectLinkedFileProvider, UrlLinkedFileProvider } from '../api/extendedBase';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
-import type { EventsHandler } from '../api/socketio';
 
 const __OUTPUTS_ID = `${ROOT_NAME}-outputs`;
 
@@ -122,9 +121,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     private initializing?: Promise<ProjectEntity>;
     private retryConnection: number = 0;
 
-    public wasOffline = false;
-    public offlineModalShown = false;
-    public resolveOfflineNotice?: () => void; // call to close the sticky notice
+    private remoteWatchAttached = false;
 
     private outputBuildId?: string;
     private notify: (events: vscode.FileChangeEvent[]) => void;
@@ -158,6 +155,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (res) {
             this.api = res.api;
             this.socket = res.socket;
+            this.ensureSocketLifecycleBridge();
         } else {
             throw new Error(vscode.l10n.t('Cannot init SocketIOAPI for {serverName}', { serverName }));
         }
@@ -182,30 +180,38 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (this.lifecycleHooked) return;
         this.lifecycleHooked = true;
 
-        // Use the SocketIOAPI's handler API exactly once
-        this.socket.updateEventHandlers({
-            onDisconnected: () => {
-                try { this._onDidDisconnect.fire(); } catch { }
-            },
-            onConnectionAccepted: (_publicId: string) => {
-                try { this._onDidReconnect.fire(); } catch { }
-            },
-        });
-
-        // If you want to be extra-safe with the EventBus (used in v2 path),
-        // bump its limit or just leave it—since we register once now:
-        try {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            (EventBus as any).setMaxListeners?.(0); // optional: disable max limit
-        } catch { }
+        // this.socket.updateEventHandlers({
+        //     onDisconnected: () => {
+        //     console.log('[VFS] onDisconnected');
+        //     try { this._onDidDisconnect.fire(); } catch { }
+        //     // Show the modal once; then keep a sticky until reconnect.
+        //     void this.handleDisconnect();
+        //     },
+        //     onConnectionAccepted: (_publicId: string) => {
+        //     console.log('[VFS] onConnectionAccepted');
+        //     try { this._onDidReconnect.fire(); } catch { }
+        //     },
+        // });
     }
 
     /** Public helper so other classes can subscribe without touching the raw socket. */
     public onSocketLifecycle(handlers: { onDisconnected?: () => void; onReconnected?: () => void }): vscode.Disposable {
         this.ensureSocketLifecycleBridge();
         const subs: vscode.Disposable[] = [];
-        if (handlers.onDisconnected) subs.push(this.onDidDisconnect(handlers.onDisconnected));
-        if (handlers.onReconnected) subs.push(this.onDidReconnect(handlers.onReconnected));
+
+        if (handlers.onDisconnected) {
+            subs.push(this.onDidDisconnect(handlers.onDisconnected));
+        }
+
+        if (handlers.onReconnected) {
+            // Wrap user handler with modal/sticky cleanup
+            subs.push(this.onDidReconnect(() => {
+                this.retryConnection = 0;
+                // Call user-provided handler after cleanup
+                handlers.onReconnected?.();
+            }));
+        }
+
         return vscode.Disposable.from(...subs);
     }
 
@@ -216,45 +222,22 @@ export class VirtualFileSystem extends vscode.Disposable {
         super.dispose();
     }
 
-    // ---- on disconnect: modal first, then sticky notice ----
-    private async handleDisconnect() {
-        if (this.offlineModalShown) return;       // only once per outage
-        this.offlineModalShown = true;
-        this.wasOffline = true;
-
-        const title = vscode.l10n.t('You have lost connection to {0}.', this.serverName);
-        const detail = vscode.l10n.t("If you're in a local replica, it is safe to continue editing. You'll be prompted to reconcile your changes upon reconnecting.");
-
-        // 1) Modal — user must dismiss to resume editing
-        await vscode.window.showWarningMessage(title, { modal: true, detail }, vscode.l10n.t('OK'));
-
-        // 2) Sticky, non-error notification that persists while offline
-        if (!this.resolveOfflineNotice) {
-            let resolve!: () => void;
-            const gate = new Promise<void>(r => (resolve = r));
-            this.resolveOfflineNotice = resolve;
-
-            void vscode.window.withProgress(
-                { location: vscode.ProgressLocation.Notification, title },
-                async (progress) => {
-                    progress.report({ message: detail });
-                    await gate; // stays visible until we resolve it on reconnect
-                }
-            );
-        }
-    }
-
     private get initializingPromise(): Promise<ProjectEntity> {
 
-        if (this.retryConnection >= 2) {
-            this.handleDisconnect();
-        }
+        // if (this.retryConnection >= 2) {
+        //     this.handleDisconnect();
+        // }
 
         // Always re-init the socket before trying again
         this.socket.init();
 
-        this.remoteWatch();
+        // in initializingPromise() BEFORE calling remoteWatch():
+        if (!this.remoteWatchAttached) {
+            this.remoteWatch();
+            this.remoteWatchAttached = true;
+        }
         this.root = undefined;
+
         return this.socket.joinProject(this.projectId).then(async (project) => {
             const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
             project.settings = (await this.api.getProjectSettings(identity, this.projectId)).settings!;
@@ -382,14 +365,31 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     private remoteWatch(): void {
         this.socket.updateEventHandlers({
+            // onDisconnected: () => {
+            //     if (this.root === undefined) return;
+            //     this.retryConnection += 1;
+            //     this.initializing = this.initializingPromise;
+            // },
+            // onConnectionAccepted: (publicId: string) => {
+            //     this.retryConnection = 0;
+            //     this.publicId = publicId;
+            // },
             onDisconnected: () => {
-                if (this.root === undefined) return;
+                console.log('[VFS] onDisconnected');
+                console.count('[VFS] disconnect fired');
+                try { this._onDidDisconnect.fire(); } catch { }
+
+                // 👇 Re-init and re-join so we’ll get connectionAccepted again.
+                if (this.root === undefined) return;   // ignore very early drops
                 this.retryConnection += 1;
-                this.initializing = this.initializingPromise;
+                this.initializing = this.initializingPromise;  // <-- triggers socket.init() + joinProject()
             },
-            onConnectionAccepted: (publicId: string) => {
+
+            onConnectionAccepted: (_publicId: string) => {
+                console.log('[VFS] onConnectionAccepted');
+                console.count('[VFS] connectionAccepted fired');
                 this.retryConnection = 0;
-                this.publicId = publicId;
+                try { this._onDidReconnect.fire(); } catch { }
             },
             onFileCreated: (parentFolderId: string, type: FileType, entity: FileEntity) => {
                 const res = this._resolveById(parentFolderId);

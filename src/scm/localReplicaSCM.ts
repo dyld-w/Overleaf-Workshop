@@ -3,7 +3,6 @@ import { minimatch } from 'minimatch';
 import { BaseSCM, CommitItem, SettingItem } from ".";
 import { VirtualFileSystem, parseUri } from '../core/remoteFileSystemProvider';
 import * as merge from '../merge';
-import { ROOT_NAME } from "../consts";
 import { ActiveReplica } from "../utils/activeReplica";
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
@@ -78,7 +77,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         '**/*.xdv',
         '**/main.pdf',
         '**/output.pdf',
+        '.vscode/**'
     ];
+
+    public wasOffline = false;
+    public offlineModalShown = false;
+    public resolveOfflineNotice?: () => void; // call to close the sticky notice
+    private syncSuspended = false;              // gate watchers during bulk reconcile
+    private bulkInFlight?: Promise<void>;       // debounce concurrent runs
 
     constructor(
         protected readonly vfs: VirtualFileSystem,
@@ -339,9 +345,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     // 1) Add a couple of fields to coordinate reconnect reconciles
-    private syncSuspended = false;              // gate watchers during bulk reconcile
-    private wasOffline = false;                 // track offline→online transitions
-    private bulkInFlight?: Promise<void>;       // debounce concurrent runs
+
 
     /** Merge-first reconcile used on reconnect/updates.
      *  Produces a single RESULT, writes only when content differs, and advances BASE.
@@ -558,35 +562,73 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         // Subscribe via VFS' bridged events (which hook the socket exactly once)
         const lifecycle = this.vfs.onSocketLifecycle({
             onDisconnected: () => {
-                console.log("ONDISCONNECTED");
+                console.log("[LocalReplicaSCM] disconnected");
+                console.count('[SCM] onDisconnected');
                 this.wasOffline = true;
+                this.syncSuspended = true;          // 🚫 freeze immediately
+                this.handleDisconnect();           // 🔔 modal + sticky (only once)
             },
             onReconnected: async () => {
-                console.log("onReconnected");
-                if (!this.wasOffline) return;             // ignore cold starts
+                console.log("[LocalReplicaSCM] reconnected");
+                console.count('[SCM] onReconnected');
+                if (!this.wasOffline) return;       // ignore cold start connects
                 this.wasOffline = false;
 
-                // Close the persistent offline notice
-                if (this.vfs.resolveOfflineNotice) {
-                    this.vfs.resolveOfflineNotice();
-                    this.vfs.resolveOfflineNotice = undefined;
+                // ✅ Close the sticky and reset one-shot flag
+                if (this.resolveOfflineNotice) {
+                    try { this.resolveOfflineNotice(); } catch { }
+                    this.resolveOfflineNotice = undefined;
                 }
-                // Allow next outage to show the modal again
-                this.vfs.offlineModalShown = false;
+                this.offlineModalShown = false;
 
+                // Offer reconcile; remain suspended until user accepts
                 const choice = await vscode.window.showInformationMessage(
-                    vscode.l10n.t('Connection restored. Reconcile changes now?'),
+                    vscode.l10n.t('Connection restored. Reconcile Local Replica with server now?'),
                     vscode.l10n.t('Reconcile now'),
-                    vscode.l10n.t('Ignore')
+                    vscode.l10n.t('Dismiss')
                 );
+
                 if (choice === vscode.l10n.t('Reconcile now')) {
+                    // Bulk reconcile: pulls remote, compares to base, 3-way merge editor if needed
                     await this.reconcileAll('/');
+                    this.syncSuspended = false;       // ✅ resume normal syncing after successful reconcile
+                } else {
+                    // User dismissed — keep sync suspended to avoid silent overwrites.
                 }
-                // Ignore = do nothing
             },
         });
 
-        return [...disposables, lifecycle, this.vfsWatcher!, this.localWatcher!];
+        disposables.push(lifecycle);
+
+        return [...disposables, this.vfsWatcher!, this.localWatcher!];
+    }
+
+    // ---- on disconnect: modal first, then sticky notice ----
+    private async handleDisconnect() {
+        if (this.offlineModalShown) return;       // only once per outage
+        this.offlineModalShown = true;
+        this.wasOffline = true;
+
+        const title = vscode.l10n.t('You have lost connection to the server.');
+        const detail = vscode.l10n.t("If you're in a local replica, it is safe to continue editing. You'll be prompted to reconcile your changes upon reconnecting.");
+
+        // 1) Modal — user must dismiss to resume editing
+        await vscode.window.showWarningMessage(title, { modal: true, detail }, vscode.l10n.t('OK'));
+
+        // 2) Sticky, non-error notification that persists while offline
+        if (!this.resolveOfflineNotice) {
+            let resolve!: () => void;
+            const gate = new Promise<void>(r => (resolve = r));
+            this.resolveOfflineNotice = resolve;
+
+            void vscode.window.withProgress(
+                { location: vscode.ProgressLocation.Notification, title },
+                async (progress) => {
+                    progress.report({ message: detail });
+                    await gate; // stays visible until we resolve it on reconnect
+                }
+            );
+        }
     }
 
     writeFile(relPath: string, content: Uint8Array): Thenable<void> {
