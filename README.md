@@ -34,6 +34,9 @@ This extension relies on the `code` command for merge/edit helpers and deep-link
 ## Fetching New Latest Version
 **macOS**
 ```
+# Create temp dir and enter it
+tmpdir="$(mktemp -d)"; pushd "$tmpdir"
+
 # Download latest release asset + checksum
 curl -L -O https://github.com/dyld-w/Overleaf-Workshop/releases/latest/download/overleaf-workshop-enhanced.vsix
 curl -L -O https://github.com/dyld-w/Overleaf-Workshop/releases/latest/download/overleaf-workshop-enhanced.vsix.sha256
@@ -41,12 +44,18 @@ curl -L -O https://github.com/dyld-w/Overleaf-Workshop/releases/latest/download/
 # Verify checksum (should print "OK")
 shasum -a 256 -c overleaf-workshop-enhanced.vsix.sha256
 
-# Install into VS Code (use full path to `code` if needed)
-code --install-extension overleaf-workshop-enhanced.vsix --force
+# Install into VS Code
+code --install-extension ./overleaf-workshop-enhanced.vsix --force
+
+# Leave and remove temp dir
+popd; rm -rf "$tmpdir"
 ```
 
 **Linux**
 ```
+# Create temp dir and enter it
+tmpdir="$(mktemp -d)"; pushd "$tmpdir"
+
 # Download latest release asset + checksum
 curl -L -O https://github.com/dyld-w/Overleaf-Workshop/releases/latest/download/overleaf-workshop-enhanced.vsix
 curl -L -O https://github.com/dyld-w/Overleaf-Workshop/releases/latest/download/overleaf-workshop-enhanced.vsix.sha256
@@ -55,32 +64,34 @@ curl -L -O https://github.com/dyld-w/Overleaf-Workshop/releases/latest/download/
 sha256sum -c overleaf-workshop-enhanced.vsix.sha256
 
 # Install into VS Code
-code --install-extension overleaf-workshop-enhanced.vsix --force
+code --install-extension ./overleaf-workshop-enhanced.vsix --force
+
+# Leave and remove temp dir
+popd; rm -rf "$tmpdir"
 ```
 
 **Windows (PowerShell)**
 ```
-# Download latest release asset + checksum
-Invoke-WebRequest `
-  -Uri "https://github.com/dyld-w/Overleaf-Workshop/releases/latest/download/overleaf-workshop-enhanced.vsix" `
-  -OutFile "overleaf-workshop-enhanced.vsix"
+# Create temp dir and enter it
+$tmp = Join-Path $env:TEMP ("overleaf-workshop-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $tmp | Out-Null
+Push-Location $tmp
 
-Invoke-WebRequest `
-  -Uri "https://github.com/dyld-w/Overleaf-Workshop/releases/latest/download/overleaf-workshop-enhanced.vsix.sha256" `
-  -OutFile "overleaf-workshop-enhanced.vsix.sha256"
+# Download latest release asset + checksum
+Invoke-WebRequest -Uri "https://github.com/dyld-w/Overleaf-Workshop/releases/latest/download/overleaf-workshop-enhanced.vsix" -OutFile "overleaf-workshop-enhanced.vsix"
+Invoke-WebRequest -Uri "https://github.com/dyld-w/Overleaf-Workshop/releases/latest/download/overleaf-workshop-enhanced.vsix.sha256" -OutFile "overleaf-workshop-enhanced.vsix.sha256"
 
 # Verify checksum
-Get-FileHash overleaf-workshop-enhanced.vsix -Algorithm SHA256 | ForEach-Object {
-    $expected = Get-Content overleaf-workshop-enhanced.vsix.sha256
-    if ($_.Hash.ToLower() -eq $expected.Split()[0].ToLower()) {
-        "Checksum OK"
-    } else {
-        throw "Checksum MISMATCH!"
-    }
-}
+$hash = (Get-FileHash .\overleaf-workshop-enhanced.vsix -Algorithm SHA256).Hash.ToLower()
+$expected = (Get-Content .\overleaf-workshop-enhanced.vsix.sha256).Split()[0].ToLower()
+if ($hash -ne $expected) { throw "Checksum MISMATCH! expected $expected got $hash" } else { "Checksum OK" }
 
 # Install into VS Code
 code --install-extension .\overleaf-workshop-enhanced.vsix --force
+
+# Leave and remove temp dir
+Pop-Location
+Remove-Item $tmp -Recurse -Force
 ```
 
 

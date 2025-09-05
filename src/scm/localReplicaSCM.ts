@@ -8,6 +8,10 @@ import { isReplica } from '../utils/isReplica';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
 
+/** How to resolve true binary conflicts (when all three differ and neither equals BASE). */
+type BinaryStrategy = 'prefer-remote' | 'prefer-local';
+const BINARY_CONFLICT_STRATEGY: BinaryStrategy = 'prefer-remote';
+
 type FileCache = { date: number, hash: number };
 
 /**
@@ -199,7 +203,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             if (action === 'push' && cache[0].hash === thisHash) { return false; }
             if (action === 'pull' && cache[1].hash === thisHash) { return false; }
             if (cache[0].hash !== cache[1].hash) {
-                if (action === 'push' && now - cache[0].date < 500 || action === 'pull' && now - cache[1].date < 500) {
+                if ((action === 'push' && now - cache[0].date < 500) || (action === 'pull' && now - cache[1].date < 500)) {
                     this.setBypassCache(relPath, content, action);
                     return true;
                 }
@@ -268,18 +272,27 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private baseStoreRoot(): vscode.Uri {
         return vscode.Uri.joinPath(this.baseUri, '.overleaf', 'base');
     }
+    private conflictsRoot(): vscode.Uri {
+        return vscode.Uri.joinPath(this.baseUri, '.overleaf', 'conflicts');
+    }
     private relSegments(relPath: string): string[] {
         const rel = relPath.startsWith('/') ? relPath.slice(1) : relPath;
         return rel ? rel.split('/') : [];
     }
     private baseSnapUri(relPath: string): vscode.Uri {
-        const segs = this.relSegments(relPath);
-        return vscode.Uri.joinPath(this.baseStoreRoot(), ...segs);
+        const segments = this.relSegments(relPath);
+        return vscode.Uri.joinPath(this.baseStoreRoot(), ...segments);
     }
     private baseSnapDirUri(relPath: string): vscode.Uri {
-        const segs = this.relSegments(relPath);
-        segs.pop(); // parent only
-        return vscode.Uri.joinPath(this.baseStoreRoot(), ...segs);
+        const segments = this.relSegments(relPath);
+        segments.pop(); // parent only
+        return vscode.Uri.joinPath(this.baseStoreRoot(), ...segments);
+    }
+    private conflictArtifactUri(relPath: string, suffix: 'LOCAL' | 'REMOTE' | 'BASE'): vscode.Uri {
+        const segments = this.relSegments(relPath);
+        const file = segments.pop() ?? 'file';
+        const parent = vscode.Uri.joinPath(this.conflictsRoot(), ...segments);
+        return vscode.Uri.joinPath(parent, `${file}.${suffix}`);
     }
 
     // --- Helper: only snapshot files that aren't ignored -------------------------
@@ -292,10 +305,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private async ensureBaseStore(): Promise<void> {
         try { await vscode.workspace.fs.createDirectory(this.baseStoreRoot()); } catch { /* noop */ }
     }
+    private async ensureConflictsStore(relPath: string): Promise<void> {
+        const segments = this.relSegments(relPath);
+        segments.pop();
+        try { await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(this.conflictsRoot(), ...segments)); } catch { /* noop */ }
+    }
 
     private async writeBaseSnapshot(relPath: string, bytes: Uint8Array): Promise<void> {
         if (!this.shouldSnapshot(relPath)) return;                  // ⛔ ignored → no snapshot
-        if (isProbablyBinary(bytes)) return;                        // ⛔ binary → no snapshot (keeps binaries out of merge base)
         await this.ensureBaseStore();
         await vscode.workspace.fs.createDirectory(this.baseSnapDirUri(relPath)); // mkdir -p
         await vscode.workspace.fs.writeFile(this.baseSnapUri(relPath), bytes);
@@ -330,14 +347,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     q.push({ uri: child, prefix: prefix + name + '/' });
                 } else if (type === vscode.FileType.File) {
                     const relPath = prefix + name; // leading '/'
-                    if (this.shouldSnapshot(relPath)) {              // ✅ only load non-ignored
+                    if (this.shouldSnapshot(relPath)) {
                         try {
                             const bytes = await vscode.workspace.fs.readFile(child);
-                            // Note: on-disk store should already be text-only due to write guard,
-                            // but keep a defensive binary check just in case.
-                            if (!isProbablyBinary(bytes)) {
-                                this.baseCache[relPath] = bytes;
-                            }
+                            // ✅ load whatever is there (text or binary)
+                            this.baseCache[relPath] = bytes;
                         } catch { /* ignore unreadable */ }
                     }
                 }
@@ -345,12 +359,112 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
-    // 1) Add a couple of fields to coordinate reconnect reconciles
+    // --------------------------- Binary reconcile -------------------------------
+    private bytesEq(a?: Uint8Array, b?: Uint8Array): boolean {
+        if (!a || !b) return false;
+        if (a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+        return true;
+    }
 
+    /** Write an artifact copy into .overleaf/conflicts to preserve the losing side. */
+    private async writeConflictArtifact(relPath: string, suffix: 'LOCAL' | 'REMOTE' | 'BASE', bytes?: Uint8Array) {
+        if (!bytes) return;
+        await this.ensureConflictsStore(relPath);
+        const uri = this.conflictArtifactUri(relPath, suffix);
+        await vscode.workspace.fs.writeFile(uri, bytes);
+    }
+
+    /** Binary reconcile path: deterministic and editor-less. */
+    private async reconcileBinary(relPath: string, vfsUri: vscode.Uri, baseBytes?: Uint8Array, localBytes?: Uint8Array, remoteBytes?: Uint8Array): Promise<'noop' | 'merged'> {
+        // Nothing anywhere → clean state
+        if (!localBytes && !remoteBytes) {
+            delete this.baseCache[relPath];
+            await this.deleteBaseSnapshot(relPath);
+            return 'noop';
+        }
+
+        // If only one side exists → copy it to the other and advance BASE
+        if (localBytes && !remoteBytes) {
+            // push local to remote
+            this.setBypassCache(relPath, localBytes);
+            await vscode.workspace.fs.writeFile(vfsUri, localBytes);
+            this.baseCache[relPath] = localBytes;
+            await this.writeBaseSnapshot(relPath, localBytes);
+            return 'merged';
+        }
+        if (!localBytes && remoteBytes) {
+            // pull remote to local
+            this.setBypassCache(relPath, remoteBytes);
+            await this.writeFile(relPath, remoteBytes);
+            this.baseCache[relPath] = remoteBytes;
+            await this.writeBaseSnapshot(relPath, remoteBytes);
+            return 'merged';
+        }
+
+        // Both exist
+        const local = localBytes!;
+        const remote = remoteBytes!;
+        const base = baseBytes;
+
+        // Any two equal → take that side
+        if (this.bytesEq(local, remote)) {
+            this.baseCache[relPath] = local;
+            await this.writeBaseSnapshot(relPath, local);
+            return 'noop';
+        }
+        if (base && this.bytesEq(local, base) && !this.bytesEq(remote, base)) {
+            // Local unchanged vs BASE → take remote
+            this.setBypassCache(relPath, remote);
+            await this.writeFile(relPath, remote);
+            this.setBypassCache(relPath, remote);
+            await vscode.workspace.fs.writeFile(vfsUri, remote);
+            this.baseCache[relPath] = remote;
+            await this.writeBaseSnapshot(relPath, remote);
+            return 'merged';
+        }
+        if (base && this.bytesEq(remote, base) && !this.bytesEq(local, base)) {
+            // Remote unchanged vs BASE → take local
+            this.setBypassCache(relPath, local);
+            await vscode.workspace.fs.writeFile(vfsUri, local);
+            this.setBypassCache(relPath, local);
+            await this.writeFile(relPath, local);
+            this.baseCache[relPath] = local;
+            await this.writeBaseSnapshot(relPath, local);
+            return 'merged';
+        }
+
+        // True conflict (all different). Choose a winner; save loser as artifact.
+        const winner: 'REMOTE' | 'LOCAL' = (BINARY_CONFLICT_STRATEGY === 'prefer-remote') ? 'REMOTE' : 'LOCAL';
+        const result = winner === 'REMOTE' ? remote : local;
+        const loserBytes = winner === 'REMOTE' ? local : remote;
+        const loserTag: 'LOCAL' | 'REMOTE' = winner === 'REMOTE' ? 'LOCAL' : 'REMOTE';
+
+        await this.writeConflictArtifact(relPath, loserTag, loserBytes);
+        if (base) await this.writeConflictArtifact(relPath, 'BASE', base);
+
+        // Write winner to both sides and advance BASE
+        this.setBypassCache(relPath, result);
+        await this.writeFile(relPath, result);
+        this.setBypassCache(relPath, result);
+        await vscode.workspace.fs.writeFile(vfsUri, result);
+
+        this.baseCache[relPath] = result;
+        await this.writeBaseSnapshot(relPath, result);
+
+        // Optional: surface a one-time notification
+        vscode.window.showWarningMessage(
+            vscode.l10n.t(`Binary conflict on {0}: kept {1}, saved other copy to .overleaf/conflicts`, relPath, winner)
+        );
+
+        return 'merged';
+    }
+
+    // --------------------------- Text reconcile (unchanged) ----------------------
 
     /** Merge-first reconcile used on reconnect/updates.
      *  Produces a single RESULT, writes only when content differs, and advances BASE.
-     *  BINARY SAFETY: if any side looks binary, skip reconcile entirely (no BASE advance).
+     *  For binaries: routes to reconcileBinary (no skipping).
      */
     private async reconcileOnReconnect(
         relPath: string,
@@ -371,14 +485,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         try { remoteBytes = await vscode.workspace.fs.readFile(vfsUri); }
         catch { remoteBytes = undefined; }
 
-        const bytesEq = (a?: Uint8Array, b?: Uint8Array) =>
-            !!a && !!b && a.length === b.length && a.every((v, i) => v === b[i]);
-
-        // --- BINARY GUARD: if any side appears binary, do nothing on reconcile ---
+        // ── If any side looks binary, handle with the binary reconcilor ──────────
         if (isProbablyBinary(baseBytes) || isProbablyBinary(localBytes) || isProbablyBinary(remoteBytes)) {
-            // Intentionally skip merge/editor and do not advance BASE for binaries.
-            console.log(`[reconcile] Skip binary file: ${relPath}`);
-            return 'noop';
+            return await this.reconcileBinary(relPath, vfsUri, baseBytes, localBytes, remoteBytes);
         }
 
         // Nothing anywhere
@@ -394,7 +503,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         // ── No BASE known: never pick a side silently ─────────────────────────────
         if (!baseBytes) {
             if (localBytes && remoteBytes) {
-                if (bytesEq(localBytes, remoteBytes)) {
+                if (this.bytesEq(localBytes, remoteBytes)) {
                     this.baseCache[relPath] = remoteBytes;
                     await this.writeBaseSnapshot(relPath, remoteBytes);
                     return 'noop';
@@ -430,8 +539,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const resultBytes = te.encode(resultText);
 
         // Only write when content actually changes (prevents echo churn)
-        const needWriteLocal = !localBytes || !bytesEq(localBytes, resultBytes);
-        const needWriteRemote = !remoteBytes || !bytesEq(remoteBytes, resultBytes);
+        const needWriteLocal = !localBytes || !this.bytesEq(localBytes, resultBytes);
+        const needWriteRemote = !remoteBytes || !this.bytesEq(remoteBytes, resultBytes);
 
         if (!needWriteLocal && !needWriteRemote) {
             // Both already at RESULT; advance BASE
