@@ -7,3 +7,5 @@ out
 **/vendor/**
 
 .DS_Store
+
+*.sha256

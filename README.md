@@ -9,7 +9,7 @@
 Open Overleaf (ShareLatex) projects in VSCode, with full collaboration support.
 
 ## NOTE
-This is a forked version of the excellent [Overleaf Workshop](https://github.com/iamhyc/Overleaf-Workshop) project that [iamhyc](https://github.com/iamhyc/Overleaf-Workshop) started. The core difference that this version has more robust conflict resolution to better suit my use-case. More specifically, it invokes the `git` and `code` CLIs for detecting merge conflicts and launching a 3-way merge editor respectively.
+This is a forked version of the excellent [Overleaf Workshop](https://github.com/iamhyc/Overleaf-Workshop) project that [iamhyc](https://github.com/iamhyc/Overleaf-Workshop) started. The core difference is that this version has more robust conflict resolution to better suit my use-case. More specifically, it invokes the `git` and `code` CLIs for detecting merge conflicts and launching a 3-way merge editor respectively.
 
 ## Fetching New Latest Version
 **macOS**
@@ -22,7 +22,7 @@ curl -L -O https://github.com/dyld-w/Overleaf-Workshop/releases/latest/download/
 shasum -a 256 -c overleaf-workshop-enhanced.vsix.sha256
 
 # Install into VS Code (use full path to `code` if needed)
-code --install-extension overleaf-workshop-enhanced.vsix
+code --install-extension overleaf-workshop-enhanced.vsix --force
 ```
 
 **Linux**
@@ -35,7 +35,7 @@ curl -L -O https://github.com/dyld-w/Overleaf-Workshop/releases/latest/download/
 sha256sum -c overleaf-workshop-enhanced.vsix.sha256
 
 # Install into VS Code
-code --install-extension overleaf-workshop-enhanced.vsix
+code --install-extension overleaf-workshop-enhanced.vsix --force
 ```
 
 **Windows (PowerShell)**
@@ -60,8 +60,15 @@ Get-FileHash overleaf-workshop-enhanced.vsix -Algorithm SHA256 | ForEach-Object 
 }
 
 # Install into VS Code
-code --install-extension .\overleaf-workshop-enhanced.vsix
+code --install-extension .\overleaf-workshop-enhanced.vsix --force
 ```
+
+
+
+---
+
+## iamhyc's Documentation
+While most of the below is still accurate, I can't guarantee it'll all be accurate as documentation falls at much lower priority than functionality for my fork.
 
 ### User Guide
 

@@ -32,7 +32,6 @@ jobs:
 
       - name: Package VSIX (+ checksum)
         id: pkg
-        shell: bash
         run: |
           SHORT_SHA=$(git rev-parse --short HEAD)
           BASE_VERSION=$(jq -r '.version' package.json)
