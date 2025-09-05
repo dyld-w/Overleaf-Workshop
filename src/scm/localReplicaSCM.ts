@@ -3,6 +3,8 @@ import { minimatch } from 'minimatch';
 import { BaseSCM, CommitItem, SettingItem } from ".";
 import { VirtualFileSystem, parseUri } from '../core/remoteFileSystemProvider';
 import * as merge from '../merge';
+import { ActiveReplica } from "../utils/activeReplica";
+import { isReplica } from '../utils/isReplica';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
 
@@ -76,13 +78,21 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         '**/*.xdv',
         '**/main.pdf',
         '**/output.pdf',
+        '.vscode/**'
     ];
+
+    public wasOffline = false;
+    public offlineModalShown = false;
+    public resolveOfflineNotice?: () => void; // call to close the sticky notice
+    private syncSuspended = false;              // gate watchers during bulk reconcile
+    private bulkInFlight?: Promise<void>;       // debounce concurrent runs
 
     constructor(
         protected readonly vfs: VirtualFileSystem,
         public readonly baseUri: vscode.Uri,
     ) {
         super(vfs, baseUri);
+        ActiveReplica.set(this);
     }
 
     public static async validateBaseUri(uri: string, projectName?: string): Promise<vscode.Uri> {
@@ -336,9 +346,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     // 1) Add a couple of fields to coordinate reconnect reconciles
-    private syncSuspended = false;              // gate watchers during bulk reconcile
-    private wasOffline = false;                 // track offline→online transitions
-    private bulkInFlight?: Promise<void>;       // debounce concurrent runs
+
 
     /** Merge-first reconcile used on reconnect/updates.
      *  Produces a single RESULT, writes only when content differs, and advances BASE.
@@ -480,7 +488,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         try { await this.bulkInFlight; } finally { this.bulkInFlight = undefined; }
     }
 
-    // 3) Gate watchers so they don’t echo during bulk reconciles
+    public async reconcileNow() {
+        console.log("reconcileNow")
+        await this.reconcileAll("/");
+    }
+
     private async syncFromVFS(vfsUri: vscode.Uri, type: 'update' | 'delete') {
         if (this.syncSuspended) return;
         const { pathParts } = parseUri(vfsUri);
@@ -498,6 +510,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         if (!vfsUri) return;
         await this.applySync('push', type, relPath, localUri, vfsUri);
     }
+
     private async ensureSettingsJson(): Promise<void> {
         // .overleaf/settings.json
         const overleafDir = vscode.Uri.joinPath(this.baseUri, '.overleaf');
@@ -521,6 +534,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const bytes = new TextEncoder().encode(JSON.stringify(settings, null, 4));
         await vscode.workspace.fs.writeFile(settingUri, bytes);
     }
+
     private async initWatch() {
         // write ".overleaf/settings.json" if it does not exist
         await this.ensureSettingsJson();
@@ -535,7 +549,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         // Initial merge-first reconcile (no overwrite)
         await this.ensureBaseStore();
         await this.loadAllBaseSnapshots();
-        await this.reconcileAll('/');
+        // await this.reconcileAll('/');
 
         const disposables: vscode.Disposable[] = [
             this.vfsWatcher.onDidChange(async uri => { if (!this.syncSuspended) await this.syncFromVFS(uri, 'update'); }),
@@ -548,15 +562,77 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
         // Subscribe via VFS' bridged events (which hook the socket exactly once)
         const lifecycle = this.vfs.onSocketLifecycle({
-            onDisconnected: () => { this.wasOffline = true; },
+            onDisconnected: async () => {
+                this.wasOffline = true;
+                this.syncSuspended = true;          // 🚫 freeze immediately
+                if (await isReplica()) this.handleReplicaDisconnect();           // 🔔 modal + sticky (only once)
+            },
             onReconnected: async () => {
-                if (!this.wasOffline) return;
+                if (!this.wasOffline) return;       // ignore cold start connects
                 this.wasOffline = false;
-                await this.reconcileAll('/');
+                if (await isReplica()) this.handleReplicaReconnect();           // 🔔 modal + sticky (only once)
             },
         });
 
-        return [...disposables, lifecycle, this.vfsWatcher!, this.localWatcher!];
+        disposables.push(lifecycle);
+
+        return [...disposables, this.vfsWatcher!, this.localWatcher!];
+    }
+
+    // ---- on disconnect: modal first, then sticky notice ----
+    private async handleReplicaDisconnect() {
+        console.log("[LocalReplicaSCM] disconnected");
+        console.count('[SCM] onDisconnected');
+        if (this.offlineModalShown) return;       // only once per outage
+        this.offlineModalShown = true;
+        this.wasOffline = true;
+
+        const title = vscode.l10n.t('You have lost connection to the server.');
+        const detail = vscode.l10n.t("Since you're in a local replica, it is safe to continue editing. You'll be prompted to reconcile your changes upon reconnecting.");
+
+        // 1) Modal — user must dismiss to resume editing
+        await vscode.window.showWarningMessage(title, { modal: true, detail }, vscode.l10n.t('OK'));
+
+        // 2) Sticky, non-error notification that persists while offline
+        if (!this.resolveOfflineNotice) {
+            let resolve!: () => void;
+            const gate = new Promise<void>(r => (resolve = r));
+            this.resolveOfflineNotice = resolve;
+
+            void vscode.window.withProgress(
+                { location: vscode.ProgressLocation.Notification, title },
+                async (progress) => {
+                    progress.report({ message: detail });
+                    await gate; // stays visible until we resolve it on reconnect
+                }
+            );
+        }
+    }
+
+    private async handleReplicaReconnect() {
+        console.log("[LocalReplicaSCM] reconnected");
+        console.count('[SCM] onReconnected');
+        // ✅ Close the sticky and reset one-shot flag
+        if (this.resolveOfflineNotice) {
+            try { this.resolveOfflineNotice(); } catch { }
+            this.resolveOfflineNotice = undefined;
+        }
+        this.offlineModalShown = false;
+
+        // Offer reconcile; remain suspended until user accepts
+        const choice = await vscode.window.showInformationMessage(
+            vscode.l10n.t('Connection restored. Reconcile Local Replica with server now?'),
+            vscode.l10n.t('Reconcile now'),
+            vscode.l10n.t('Dismiss')
+        );
+
+        if (choice === vscode.l10n.t('Reconcile now')) {
+            // Bulk reconcile: pulls remote, compares to base, 3-way merge editor if needed
+            await this.reconcileAll('/');
+            this.syncSuspended = false;       // ✅ resume normal syncing after successful reconcile
+        } else {
+            // User dismissed — keep sync suspended to avoid silent overwrites.
+        }
     }
 
     writeFile(relPath: string, content: Uint8Array): Thenable<void> {
@@ -578,15 +654,17 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     get triggers(): Promise<vscode.Disposable[]> {
         return this.initWatch().then((watches) => {
-            if (this.vfsWatcher !== undefined && this.localWatcher !== undefined) {
-                return [
-                    this.vfsWatcher,
-                    this.localWatcher,
-                    ...watches,
-                ];
-            } else {
-                return [];
-            }
+            // <- this disposable clears the active replica when triggers are disposed
+            const clearActive = new vscode.Disposable(() => {
+                if (ActiveReplica.get() === this) ActiveReplica.set(undefined);
+            });
+
+            const out: vscode.Disposable[] = [clearActive];
+
+            if (this.vfsWatcher) out.push(this.vfsWatcher);
+            if (this.localWatcher) out.push(this.localWatcher);
+
+            return [...out, ...watches];
         });
     }
 

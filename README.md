@@ -11,6 +11,26 @@ Open Overleaf (ShareLatex) projects in VSCode, with full collaboration support.
 ## NOTE
 This is a forked version of the excellent [Overleaf Workshop](https://github.com/iamhyc/Overleaf-Workshop) project that [iamhyc](https://github.com/iamhyc/Overleaf-Workshop) started. The core difference is that this version has more robust conflict resolution to better suit my use-case. More specifically, it invokes the `git` and `code` CLIs for detecting merge conflicts and launching a 3-way merge editor respectively.
 
+This is largely quick and dirty changes to get the functionality I need. TBD whether I'll revisit and refactor for best practices.
+
+## Requirements
+
+### Visual Studio Code + `code` CLI (REQUIRED)
+This extension relies on the `code` command for merge/edit helpers and deep-linking.
+
+- **Verify:** `code --version` prints a version.
+- **[macOS](https://code.visualstudio.com/docs/setup/mac#_launch-vs-code-from-the-command-line):** Open VS Code → Command Palette → **Shell Command: Install 'code' command in PATH**.  
+- **Windows:** In the VS Code installer, check **“Add to PATH”**. If needed, add:
+  - User install: `%LocalAppData%\Programs\Microsoft VS Code\bin`
+  - System install: `C:\Program Files\Microsoft VS Code\bin`
+- **Linux:** Install via your package manager (e.g., `apt`, `dnf`, `snap`) so `/usr/bin/code` (or `/snap/bin/code`) exists.
+
+### Git (REQUIRED)
+`git` is used for diffing and must be on `PATH`.
+
+- **Verify:** `git --version`  
+- **Recommended:** Git **2.25+** (modern diff flags and performance).
+
 ## Fetching New Latest Version
 **macOS**
 ```

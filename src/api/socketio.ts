@@ -123,7 +123,7 @@ export class SocketIOAPI {
         this.emit = require('util').promisify(this.socket.emit).bind(this.socket);
         // resume handlers
         this.initInternalHandlers();
-        // this.resumeEventHandlers(this._handlers);
+        this.resumeEventHandlers(this._handlers);
     }
 
     private initInternalHandlers() {
@@ -223,12 +223,17 @@ export class SocketIOAPI {
                     });
                     break;
                 case handlers.onConnectionAccepted:
-                    this.socket.on('connectionAccepted', (_:any, publicId:any) => {
-                        handler(publicId);
-                    });
-                    EventBus.on('socketioConnectedEvent', (arg:{publicId:string}) => {
+                    if (this.scheme === 'v2') {
+                        // Only EventBus in v2
+                        EventBus.on('socketioConnectedEvent', (arg: { publicId: string }) => {
                         handler(arg.publicId);
-                    });
+                        });
+                    } else {
+                        // Only native socket event in v1/Alt
+                        this.socket.on('connectionAccepted', (_: any, publicId: any) => {
+                        handler(publicId);
+                        });
+                    }
                     break;
                 case handlers.onClientUpdated:
                     this.socket.on('clientTracking.clientUpdated', (user:UpdateUserSchema) => {
